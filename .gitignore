@@ -1,3 +1,9 @@
+# Holds the room name and shared token created by `bridge.py host`
+.ccbridge_token
+
+# Holds the token in plain text - never commit it
+.mcp.json
+
 .env
 *.db
 __pycache__/
