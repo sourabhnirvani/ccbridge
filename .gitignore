@@ -1,5 +1,7 @@
-# Holds the room name and shared token created by `bridge.py host`
+# Hold the room token and your identity key, created by `bridge.py host`/`join`
 .ccbridge_token
+.ccbridge_identity
+invite.txt
 
 # Holds the token in plain text - never commit it
 .mcp.json

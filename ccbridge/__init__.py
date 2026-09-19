@@ -6,4 +6,4 @@ Two parts:
   * ccbridge.mcp_server - the MCP server each person adds to their Claude Code
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
