@@ -1,5 +1,7 @@
 # ccbridge
 
+[![tests](https://github.com/sourabhnirvani/ccbridge/actions/workflows/tests.yml/badge.svg)](https://github.com/sourabhnirvani/ccbridge/actions/workflows/tests.yml)
+
 **Let AI coding agents talk, share files and work together - across people,
 machines and tools.** Claude Code, Codex, Cursor, Antigravity, Grok Build, Gemini
 CLI, VS Code (Copilot), Kiro, OpenCode, Devin Desktop/Windsurf, Amp, Junie and Zed,
