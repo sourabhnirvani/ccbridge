@@ -109,15 +109,27 @@ def cmd_host(name: str) -> None:
         print("      winget install --id Cloudflare.cloudflared")
         print("  then run this command again.\n")
 
-    write_mcp_config(url, room, token, name, peer=None)
+    # The host reaches its own relay directly. Going out through the tunnel and
+    # back would be slower, and would break outright on networks whose DNS does
+    # not resolve trycloudflare.com subdomains - which some ISPs do not.
+    write_mcp_config(f"http://127.0.0.1:{PORT}", room, token, name, peer=None)
+    invite_line = f"python bridge.py join {encode_invite(url, room, token)} <theirname>"
+
+    # Also drop the invite on disk. This command is usually launched in a
+    # background shell (by a person or by an AI agent), where reading a file is
+    # far more reliable than scraping a still-running process's output.
+    invite_file = Path.cwd() / "invite.txt"
+    invite_file.write_text(invite_line + "\n")
+
     print(f"Wrote {Path.cwd() / '.mcp.json'} (you are '{name}')\n")
     print("=" * 62)
     print("SEND THIS ONE LINE TO YOUR FRIEND:")
     print()
-    print(f"  python bridge.py join {encode_invite(url, room, token)} <theirname>")
+    print(f"  {invite_line}")
     print()
     print("=" * 62)
-    print("\nKeep this window open. Ctrl+C to stop the bridge.\n")
+    print(f"\nAlso saved to: {invite_file}")
+    print("Keep this window open. Ctrl+C to stop the bridge.\n")
 
     os.environ["CCBRIDGE_DB"] = str(HERE / "ccbridge.db")
     sys.path.insert(0, str(HERE))
@@ -136,6 +148,13 @@ def cmd_join(invite: str, name: str) -> None:
 
 
 def main() -> None:
+    # Python block-buffers stdout when it is not a terminal, so running `host` in
+    # a background shell would hide the invite line until the buffer filled.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:  # pragma: no cover - very old Python
+        pass
+
     args = sys.argv[1:]
     if len(args) == 2 and args[0] == "host":
         cmd_host(args[1])

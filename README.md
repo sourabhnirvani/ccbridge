@@ -97,7 +97,30 @@ What an agent needs to know, precisely:
 | Then | Claude Code must be **restarted** to load the MCP server |
 
 `host` blocks forever by design — it is the relay process. Run it in a background
-shell or a separate terminal, read the invite line from its output, and move on.
+shell or a separate terminal, then read the invite from **`invite.txt`** in the
+working directory rather than scraping the running process's output.
+
+---
+
+## Troubleshooting
+
+**`python bridge.py join` fails, or the agent can't reach the relay.**
+Some ISPs' DNS servers don't resolve `*.trycloudflare.com` subdomains. Check:
+
+```bash
+nslookup <the-tunnel-host> 1.1.1.1    # works?
+nslookup <the-tunnel-host>            # fails?
+```
+
+If the first works and the second doesn't, it's your resolver. Set your network's
+DNS to `1.1.1.1` or `8.8.8.8`. (This only affects the person *joining* — the host
+talks to its own relay on localhost.)
+
+**The host sees no output.** Fixed in current versions, but if you're on an older
+copy, run with `python -u bridge.py host <name>`.
+
+**Tests pass but Claude Code shows no bridge tools.** Claude Code loads MCP servers
+at startup — restart it, and make sure `.mcp.json` is in the folder you opened.
 
 ---
 
