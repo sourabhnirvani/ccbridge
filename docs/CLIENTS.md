@@ -31,9 +31,13 @@ can take them.
 
 - **Locked rooms:** if the host started with `--allow`, only the names it listed
   can get in. Give host the same `--client` list, which lets those names in too,
-  or name them in `--allow`.
+  or name them in `--allow`. `connect` in a locked room says which name was refused.
+- **Your own tools always hear each other.** With `--allow alex`, each tool in
+  the project accepts messages from `alex` and from the project's other tools.
+  A tool connected later is added to the earlier tools' lists too.
 - **Peer filter:** a joiner who uses `--allow host` only accepts messages from
-  the name `host`, not `host-cursor`.
+  the name `host`, not `host-cursor`. Name each tool in their `--allow`
+  (`--allow host,host-cursor`).
 
 ## Where each tool's config goes
 
@@ -94,6 +98,19 @@ command, the args and `CCBRIDGE_CONFIG` from any written file.
     `# <<< ccbridge <name> <<<` to `config.toml`. It never parses and rewrites the
     rest of the file. On a re-run it replaces only that block.
   - Grok's project file gets the same kind of block.
+
+## Limits to know about
+
+- **User-wide tools start every project's entry.** Codex, Antigravity and
+  Windsurf keep one server list for all projects. Connect projects A and B, and
+  every window of that tool starts both `ccbridge-A` and `ccbridge-B`. Two windows
+  of the same tool then run two copies of A's server under one name, the
+  name-sharing problem described above. Use one window per user-wide tool, or
+  connect only one project to it.
+- **Moving a project:** the settings for Claude Code follow the project. Run
+  `connect` again for every other tool after a move, so they get the new folder.
+  For a user-wide tool, delete the old `ccbridge-<project>-<hash>` entry by hand;
+  there is no `disconnect` command yet.
 
 ## Settings each tool's MCP server reads
 

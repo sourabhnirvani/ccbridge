@@ -830,6 +830,41 @@ def test_host_with_clients_lets_them_into_its_locked_room(in_tmp, host, tools, m
     assert (in_tmp / ".mcp.json").exists() and (in_tmp / ".cursor/mcp.json").exists()
 
 
+def test_with_an_allowlist_a_projects_tools_still_hear_each_other(in_tmp, host, tools, monkeypatch):
+    from ccbridge import mcp_server
+
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", "alex", clients=["claude-code", "cursor"])
+    # A tool connected later is added to the earlier tools' lists too.
+    s = settings(in_tmp)
+    bridge.write_client(in_tmp, "grok", "sourabh-grok", s)
+    bridge._sync_allowed_peers(in_tmp)
+
+    def peers_of(client):
+        monkeypatch.setenv("CCBRIDGE_CONFIG", str(bridge.client_settings_path(in_tmp, client)))
+        return mcp_server.allowed_peers()
+
+    assert peers_of("claude-code") == {"alex", "sourabh-cursor", "sourabh-grok"}
+    assert peers_of("cursor") == {"alex", "sourabh", "sourabh-grok"}
+    assert peers_of("grok") == {"alex", "sourabh", "sourabh-cursor"}
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_tracked_tool_config_is_pointed_out(in_tmp, tools):
+    subprocess.run(["git", "init", "-q"], cwd=in_tmp, check=True)
+    (in_tmp / "opencode.json").write_text('{"theme": "x"}', encoding="utf-8")
+    subprocess.run(["git", "add", "opencode.json"], cwd=in_tmp, check=True)
+    notes = bridge.client_config_warnings(in_tmp, {"opencode": in_tmp / "opencode.json",
+                                                   "cursor": in_tmp / ".cursor/mcp.json"})
+    assert len(notes) == 1 and notes[0].startswith("opencode.json is tracked by git")
+
+
+def test_without_an_allowlist_none_is_added(in_tmp, host, tools):
+    host(while_up=lambda: bridge.cmd_connect("cursor", None))
+    assert "CCBRIDGE_ALLOWED_PEERS" not in client_settings(in_tmp, "cursor")
+    assert "CCBRIDGE_ALLOWED_PEERS" not in settings(in_tmp)
+
+
 def test_host_without_claude_code_leaves_mcp_json_alone(in_tmp, host, tools, monkeypatch):
     monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
     bridge.cmd_host("sourabh", None, clients=["cursor"])

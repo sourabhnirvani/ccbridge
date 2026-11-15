@@ -430,6 +430,36 @@ def write_client(project: Path, client: str, name: str, base: dict) -> tuple[Pat
     return path, copy
 
 
+def _sync_allowed_peers(project: Path) -> None:
+    """With an allowlist (--allow), let this project's tools hear each other too.
+
+    Every tool's settings start from the same CCBRIDGE_ALLOWED_PEERS - "alex",
+    say - which would make sourabh-cursor drop messages from sourabh. So each
+    file's list gets the names of this project's other tools. Run after every
+    host, join and connect, so a tool connected later is added to the earlier
+    tools' files as well. (Running MCP servers re-read their settings.)
+    """
+    files = {c: client_settings_path(project, c) for c in CLIENTS}
+    loaded = {}
+    for client, path in files.items():
+        try:
+            data = json.loads(_read_text(path)[0]) if path.exists() else None
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("CCBRIDGE_NAME"), str):
+            loaded[client] = data
+    own = {data["CCBRIDGE_NAME"] for data in loaded.values()}
+    for client, data in loaded.items():
+        allowed = data.get("CCBRIDGE_ALLOWED_PEERS")
+        if not isinstance(allowed, str) or not allowed.strip():
+            continue
+        names = [n.strip() for n in allowed.split(",") if n.strip()]
+        merged = list(dict.fromkeys(names + sorted(own - {data["CCBRIDGE_NAME"]})))
+        if merged != names:
+            data["CCBRIDGE_ALLOWED_PEERS"] = ",".join(merged)
+            _write_private(files[client], json.dumps(data, indent=2) + "\n")
+
+
 def _claim_names(url: str, room: str, token: str, names: dict[str, str], key: str) -> Optional[str]:
     """Claim every name in ``names`` (client -> name). Returns why the relay could
     not be reached, if it could not; raises SetupError if it said no."""
@@ -483,6 +513,20 @@ def mcp_config_warnings() -> list[str]:
             f" {leaked.stdout.split()[0]}). Anyone with a copy of this repository can"
             " join that room: whoever hosts it should run `bridge.py host --new-room`."
         )
+    return notes
+
+
+def client_config_warnings(project: Path, paths: dict[str, Path]) -> list[str]:
+    """Notes for tool configs git already tracks here (.gitignore does not cover those)."""
+    notes = []
+    for client, path in paths.items():
+        if client == DEFAULT_CLIENT or CLIENTS[client].user_wide:
+            continue  # .mcp.json: see mcp_config_warnings
+        rel = path.relative_to(project).as_posix()
+        tracked = _git("ls-files", "--error-unmatch", "--", rel)
+        if tracked is not None and tracked.returncode == 0:
+            notes.append(f"{rel} is tracked by git in this project. Its 'ccbridge' entry points"
+                         " at files on this machine - leave that change out of your commits.")
     return notes
 
 
@@ -847,9 +891,11 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
             for client in clients:
                 if client != DEFAULT_CLIENT:
                     paths[client] = write_client(project, client, names[client], base)[0]
+            _sync_allowed_peers(project)
             if adopted_legacy:
                 _remove(LEGACY_TOKEN_FILE)  # 0.2's room now belongs to this project alone
-            notes = mcp_config_warnings()  # before the invite exists: it means "ready"
+            # Before the invite exists: it means "ready".
+            notes = mcp_config_warnings() + client_config_warnings(project, paths)
 
             proc, url = (None, None) if local else start_tunnel(port)
             if url:
@@ -954,6 +1000,7 @@ def cmd_join(invite: str, name: str, allow: Optional[str],
         base = load_settings(project)
         paths = {c: (path if c == DEFAULT_CLIENT else write_client(project, c, names[c], base)[0])
                  for c in clients}
+    _sync_allowed_peers(project)
     if unreachable:
         print(f"No bridge answered at {url} ({unreachable}).")
         print("  Usually the host's bridge has stopped, or this invite is from an earlier")
@@ -970,7 +1017,7 @@ def cmd_join(invite: str, name: str, allow: Optional[str],
         print("when it asks, then ask it:")
     else:
         _warn_if_inside_ccbridge()
-        _print_notes(mcp_config_warnings())
+        _print_notes(mcp_config_warnings() + client_config_warnings(project, paths))
         _print_restart(clients, paths)
         print("Then ask any of them:")
     print('    "check the bridge - who is online?"')
@@ -1001,10 +1048,12 @@ def cmd_connect(raw_clients: str, name: Optional[str]) -> int:
         print(f"{CLIENTS[client].display}: '{names[client]}'")
         if copy:
             print(f"  (the previous file was saved as {copy})")
+    _sync_allowed_peers(project)
     if unreachable:
         print(f"\nNo bridge answered at {base['CCBRIDGE_RELAY_URL']} ({unreachable}); the names"
               " are claimed when the bridge is back. Saved the settings anyway.")
     print()
+    _print_notes(client_config_warnings(project, paths))
     _print_restart(clients, paths)
     return EXIT_UNREACHABLE if unreachable else 0
 
