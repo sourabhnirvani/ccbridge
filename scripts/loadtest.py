@@ -8,6 +8,10 @@ N agents the way the MCP server does: each joins, keeps a waiting poll open
 random peer every ~30 s, and one "lead" broadcasts to the room every few
 seconds. Reports request latencies, delivery lag and errors.
 
+The generator is one Python process: with many agents its own event loop is
+the bottleneck, so its latencies are an upper bound. To see the relay's own
+latency under load, probe it from a separate process while this runs.
+
 Or point it at a running relay with --url (it needs an open relay, or pass the
 room's token with --token and --room).
 """
@@ -159,15 +163,11 @@ async def run(args):
         print(f"{len(ready)} agents joined in {time.perf_counter() - t0:.1f} s")
         boss = asyncio.create_task(lead(args, http, stats, stop))
         await asyncio.sleep(args.seconds)
-        peers = await http.get("/v1/peers", params={"limit": 1}, headers={
-            "Authorization": f"Bearer {args.token}", "X-CCBridge-Room": args.room,
-            "X-CCBridge-Session": "x"})
         stop.set()
         await asyncio.sleep(0)
         for w in workers + [boss]:
             w.cancel()
         await asyncio.gather(*workers, boss, return_exceptions=True)
-        del peers
     stats.report(args.agents, args.seconds)
     return stats
 

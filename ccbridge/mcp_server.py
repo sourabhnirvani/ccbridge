@@ -787,13 +787,22 @@ def _short(value: object, limit: int = 200) -> str:
     return one_line(value if isinstance(value, str) else "", limit)[0]
 
 
-def _project_dir() -> str:
-    """The project this agent works on: where shared files are read and saved."""
+def _project_dir() -> Optional[str]:
+    """The project this agent works on: where shared files are read and saved.
+
+    Only ever the folder bridge.py was set up in (or CCBRIDGE_PROJECT_DIR), never
+    the current directory: a client configured for the whole user account may
+    start this server in the home folder, and sharing must not reach that far.
+    """
     for key in ("CCBRIDGE_PROJECT_DIR", "project"):
         value = setting_or_empty(key).strip()
         if value and os.path.isdir(value):
             return os.path.realpath(value)
-    return os.path.realpath(os.getcwd())
+    return None
+
+
+_NO_PROJECT = ("No project folder is configured for this bridge, so files cannot be shared"
+               " or saved. Run bridge.py host/join/connect in the project folder.")
 
 
 @_tool(annotations=ToolAnnotations(title="Set your status line", readOnlyHint=False,
@@ -862,7 +871,11 @@ SHARE_MAX_BYTES = 4 * 1024 * 1024
 def _shareable(path: str) -> tuple[Optional[str], str]:
     """(absolute path, "") if ``path`` may be shared, else (None, why not)."""
     root = _project_dir()
-    full = os.path.realpath(os.path.join(root, os.path.expanduser(path)))
+    if root is None:
+        return None, _NO_PROJECT.rstrip(".")
+    if os.path.isabs(os.path.expanduser(path)) is False:
+        path = os.path.join(root, path)
+    full = os.path.realpath(path)
     try:
         inside = os.path.commonpath([root, full]) == root
     except ValueError:  # another drive on Windows
@@ -945,9 +958,12 @@ _FILE_ID_RE = re.compile(r"^[0-9a-f]{16}\Z")
 
 
 def _inbox() -> str:
-    folder = os.path.join(_project_dir(), ".ccbridge", "inbox")
+    root = _project_dir()
+    if root is None:
+        raise NotConfigured(_NO_PROJECT)
+    folder = os.path.join(root, ".ccbridge", "inbox")
     os.makedirs(folder, exist_ok=True)
-    ignore = os.path.join(_project_dir(), ".ccbridge", ".gitignore")
+    ignore = os.path.join(root, ".ccbridge", ".gitignore")
     if not os.path.exists(ignore):
         with open(ignore, "w", encoding="utf-8") as f:
             f.write("# Files other agents shared over ccbridge. Not part of the project.\n*\n")
@@ -990,7 +1006,10 @@ def download_file(file_id: Optional[str] = None) -> str:
         return "Not saved: the file did not arrive intact (checksum mismatch). Try again."
     name = safe_file_name(resp.headers.get("X-CCBridge-File-Name"))
     sender = safe_name(resp.headers.get("X-CCBridge-From")) or "(unknown)"
-    target = os.path.join(_inbox(), f"{file_id}-{name}")
+    try:
+        target = os.path.join(_inbox(), f"{file_id}-{name}")
+    except NotConfigured as exc:
+        return f"Not saved: {exc}"
     if not os.path.exists(target):
         tmp = target + ".part"
         with open(tmp, "wb") as f:

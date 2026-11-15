@@ -35,6 +35,7 @@ import asyncio
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -524,7 +525,10 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None,
     lock = threading.Lock()
 
     sends = _Window(RATE_LIMIT_MESSAGES, RATE_LIMIT_WINDOW_SECONDS)
-    room_sends = _Window(ROOM_RATE_LIMIT_MESSAGES, RATE_LIMIT_WINDOW_SECONDS)
+    # Room-wide send budget grows with the room: a two-person room keeps the
+    # old 120 a minute, a room of a thousand gets ROOM_RATE_LIMIT_MESSAGES.
+    room_sends = _Window(min(ROOM_RATE_LIMIT_MESSAGES, max(120, 3 * max_members)),
+                         RATE_LIMIT_WINDOW_SECONDS)
     # A room may fill up all at once (a fleet of agents starting together), and
     # each may rejoin once after a relay restart.
     joins = _Window(max(JOIN_LIMIT_PER_ROOM, 2 * max_members), RATE_LIMIT_WINDOW_SECONDS)
@@ -1330,9 +1334,13 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None,
     def update_task(task_id: int, req: TaskUpdate, who: Caller = Depends(caller)) -> dict:
         if too_large(req.note):
             raise HTTPException(413, "Note too large")
-        note, flags = sanitize(req.note)
         me = who.display_name
         now = time.time()
+        with lock:
+            # Every update may message the people involved, so every update
+            # counts against the sender's limits - before any sanitizing work.
+            _rate_limit(who, now)
+        note, flags = sanitize(req.note)
         with lock:
             row = conn.execute("SELECT * FROM tasks WHERE room = ? AND id = ?", (who.room, task_id)).fetchone()
             if row is None:
@@ -1344,7 +1352,6 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None,
             if act == "comment":
                 if not note.strip():
                     raise HTTPException(400, "A comment needs a note")
-                _rate_limit(who, now)
             elif finished:
                 raise HTTPException(409, f"Task #{task_id} is already {status}")
             elif act == "claim":
@@ -1483,7 +1490,15 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None,
     def join_page(code: str, request: Request) -> Response:
         """What a person or an agent sees when they open a join link."""
         _resolve_code(code)  # a wrong code gets a 404, not instructions
-        link = f"{request.url.scheme}://{request.url.netloc}/j/{_normalize_code(code)}"
+        # Behind cloudflared the relay itself is spoken to over plain HTTP; the
+        # link people use is the tunnel's https one.
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+        scheme = scheme if scheme in ("http", "https") else request.url.scheme
+        host = request.headers.get("host") or ""
+        if not re.fullmatch(r"[A-Za-z0-9.\-]{1,253}(?::[0-9]{1,5})?|\[[0-9A-Fa-f:]+\](?::[0-9]{1,5})?", host):
+            server = request.scope.get("server") or ("127.0.0.1", 80)
+            host = f"{server[0]}:{server[1]}"  # the socket's own address, never header text
+        link = f"{scheme}://{host}/j/{_normalize_code(code)}"
         text = JOIN_PAGE.format(link=link)
         return Response(content=text, media_type="text/plain; charset=utf-8",
                         headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",

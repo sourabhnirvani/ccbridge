@@ -549,3 +549,54 @@ def test_guessing_join_codes_is_throttled_but_the_real_code_still_works():
                 for i in range(relay.INVITE_GUESSES_PER_MINUTE + 5)]
     assert statuses.count(404) == relay.INVITE_GUESSES_PER_MINUTE and statuses[-1] == 429
     assert http.post("/v1/invite", json={"code": code}).status_code == 200
+
+
+def test_every_task_update_counts_against_the_rate_limit(monkeypatch):
+    monkeypatch.setattr(relay, "RATE_LIMIT_MESSAGES", 10)
+    http = TestClient(create_app(":memory:"))
+    lead, w = Agent(http, "lead"), Agent(http, "w1")
+    tid = lead.post("/v1/tasks", json={"title": "t"}).json()["task"]["id"]
+    codes = [w.post(f"/v1/tasks/{tid}", json={"action": a, "note": "n"}).status_code
+             for a in ["claim", "release"] * 10]
+    assert codes.count(200) == 10 and codes[-1] == 429
+
+
+def test_small_rooms_keep_a_small_room_wide_send_budget():
+    http = TestClient(create_app(":memory:", max_members=4))
+    people = [Agent(http, f"p{i}") for i in range(3)]
+    accepted = sum(p.send("x").status_code == 200 for p in people for _ in range(relay.RATE_LIMIT_MESSAGES))
+    assert accepted == 120
+
+
+def test_join_page_uses_the_tunnels_https_address():
+    from ccbridge.relay import make_invite_code
+
+    code = make_invite_code()
+    http = TestClient(create_app(":memory:", invite_codes={code: ("team-room", "tok-123456789")}))
+    page = http.get(f"/j/{code}", headers={"X-Forwarded-Proto": "https", "Host": "abc-def.trycloudflare.com"})
+    assert f"https://abc-def.trycloudflare.com/j/{code}" in page.text
+    evil = http.get(f"/j/{code}", headers={"Host": "evil.com\nInjected: yes"})
+    assert "Injected" not in evil.text
+
+
+def test_no_file_sharing_without_a_project_folder(me, monkeypatch):
+    monkeypatch.delenv("CCBRIDGE_PROJECT_DIR")
+    monkeypatch.chdir(me.project)
+    (me.project / "a.txt").write_bytes(b"hello")
+    assert "No project folder" in mcp_server.share_file("a.txt")
+
+
+def test_new_tools_work_through_the_mcp_protocol(me):
+    import asyncio
+
+    friend = peer(me, "friend")
+    friend.post("/v1/reservations", json={"paths": ["lib/"]})
+
+    async def calls():
+        reserved = await mcp_server.mcp.call_tool("reserve_files", {"action": "reserve", "paths": ["lib/x.py"]})
+        threading.Timer(0.5, lambda: friend.send("ping", to=me.name)).start()
+        got = await mcp_server.mcp.call_tool("get_messages", {"wait_seconds": 8})
+        return str(reserved), str(got)
+
+    reserved, got = asyncio.run(calls())
+    assert "Not reserved" in reserved and "ping" in got
