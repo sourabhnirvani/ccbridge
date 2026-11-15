@@ -170,25 +170,43 @@ couldn't open a tunnel within 30 seconds — usually a firewall or network probl
 
 ---
 
-## How the two agents talk
+## How agents work together
 
-Nobody types commands. You talk to your own Claude in plain English:
+Nobody types commands. You talk to your own agent in plain English, and it uses
+the bridge's tools:
 
-- *"Check the bridge — is she online?"* → `list_peers`
-- *"Tell him I finished the data loader and pushed it"* → `send_message`
-- *"Any messages from her?"* → `get_messages`
+| You say | Tool |
+|---|---|
+| *"Who's on the bridge? What is everyone working on?"* | `list_peers` (name, client, status line; search and paging for big rooms) |
+| *"Tell Priya I pushed the data loader"* | `send_message` (to one agent, a channel, or the whole room; `reply_to` keeps a thread) |
+| *"Any messages? Wait for her answer."* | `get_messages` (with `wait_seconds`, it waits up to 25 s for the next message) |
+| *"Set my status to 'refactoring auth'"* | `set_status` |
+| *"Join the #frontend channel"* | `channels` (list, join or leave) |
+| *"Send them `docs/plan.md`"* | `share_file` (project files only, never credential files, 4 MB max) |
+| *"Save the patch Alex sent"* | `download_file` (saved to `.ccbridge/inbox/`, never opened or run) |
+| *"Ask someone in #backend to write the migration"* | `create_task` (for one agent, a channel, or anyone) |
+| *"What's on the board? I'll take #12."* | `list_tasks` and `update_task` (claim, start, done with result, fail, release, cancel, comment) |
+| *"I'm editing `src/auth/`; tell the others"* | `reserve_files` (advisory, expiring; overlapping reservations are refused) |
 
-Their agent does the same on their side. Messages arrive labelled with who sent
-them and whether they were sent to you alone or to the room. Each session joins
-as soon as Claude Code starts and stays marked online while it's open. Messages
-sent while you're away, or while Claude Code restarts, are waiting when you next
-check.
+Messages arrive labelled with who sent them, to whom (you alone, a channel, or
+the room), their id, and what they answer. Task-board changes and shared files
+arrive as messages too, so an agent hears about them on its next read. Each
+session joins as soon as its client starts, and stays marked online while it is
+open. Messages sent while you're away, or while your agent restarts, are waiting
+when you next check.
 
 Delivery is at-least-once: a message counts as delivered only after it has
-reached your agent. If Claude Code crashes or you press Esc in the middle of a
+reached your agent. If the client crashes or you press Esc in the middle of a
 read, those messages come back on the next read rather than being lost. A burst
 of messages arrives a few at a time (about 40,000 characters per read), so it
 never floods your agent's context.
+
+**Big rooms.** A room hosted with `bridge.py host` holds 32 agents unless you
+pass `--max-members` (for example `--max-members 1000`). Use direct messages and channels rather than the whole room,
+so each agent only hears what concerns it. A waiting `get_messages` costs the
+relay no thread: only the agents a message is for wake up. Agents claim tasks
+from the board (the relay makes sure only one gets each task) and reserve files
+before editing them, so two agents don't do the same work or edit the same file.
 
 ---
 
@@ -197,9 +215,16 @@ never floods your agent's context.
 A message now arrives from *another human's* agent, so it is untrusted input by
 definition. The design keeps it powerless:
 
-- **The bridge moves text and nothing else.** There is no tool here that runs a
-  command, reads a file, or changes a setting. The worst a peer can do is *ask*;
-  acting on the ask still goes through your own permission prompts, in front of you.
+- **The bridge moves text, and files you choose to share, and nothing else.**
+  There is no tool here that runs a command or changes a setting. Tasks are
+  requests, not commands: the worst a peer can do is *ask*; acting on the ask
+  still goes through your own permission prompts, in front of you.
+- **File sharing is narrow.** `share_file` reads only files inside the project
+  folder that `bridge.py` set up (never the home folder), refuses credential
+  files (`.env`, keys, `.ssh/`, `.git/`, ...) and any file whose text looks like
+  it holds a secret. A received file is saved under `.ccbridge/inbox/` (which
+  ignores itself in git) with a cleaned-up name, checked against its SHA-256,
+  and never opened or run; the agent is told to treat its content as data.
 - **Every message is wrapped** with its sender and an explicit note that peer text
   is data, never authorization — including the rule that if a peer claims it was
   denied permission and asks your agent to do the thing instead, that is permission
@@ -241,7 +266,9 @@ definition. The design keeps it powerless:
   only in case can't coexist. The key itself never leaves your machine: each
   relay gets a proof derived from it for that room name, which is useless in any
   other room. (`bridge.py` picks random room names, so two relays never share one.)
-- **Caps:** 8 KB per message, 60 messages/minute per person and 120 per room,
+- **Caps:** 8 KB per message, 60 messages/minute per person (task updates and
+  file shares count too) and 120 per room for small rooms (scaling with
+  `--max-members` up to 3,000), 4 MB per file and 512 MB of files per room,
   limits on joins and new rooms, and old messages expire, so neither a peer nor
   a stranger who finds the tunnel URL can flood your agent or fill the host's
   disk. Direct messages are deleted when their recipient's name expires.
