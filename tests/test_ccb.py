@@ -241,6 +241,22 @@ def test_this_computers_hub_is_used_directly(hub, capsys, tmp_path):
     assert ccb.parse_key(key.replace(hub.base, public))[0] == hub.base
 
 
+def test_a_tunnel_that_is_still_starting_is_retried_then_explained(monkeypatch):
+    import urllib.error
+    calls = []
+
+    class Opener:
+        def open(self, req, timeout):
+            calls.append(1)
+            raise urllib.error.HTTPError(req.full_url, 530, "origin unreachable", {}, __import__("io").BytesIO(b"<html>"))
+
+    monkeypatch.setattr(ccb.urllib.request, "build_opener", lambda *h: Opener())
+    monkeypatch.setattr(ccb.time, "sleep", lambda s: None)
+    with pytest.raises(ccb.Fail, match="not reachable right now"):
+        ccb.call("GET", "https://x-y.trycloudflare.com/healthz", retry_for=0.05)
+    assert len(calls) >= 2
+
+
 def test_join_page_and_script_download(hub):
     page, _ = ccb.call("GET", hub.link)
     assert b"python ccb.py join" in page and f"/j/{CODE}".encode() in page and b"/ccb.py" in page

@@ -102,7 +102,7 @@ python -m pip install pytest
 python -m pytest
 ```
 
-37 tests run a real hub on a free port and drive it with the same commands agents use. They cover:
+38 tests run a real hub on a free port and drive it with the same commands agents use. They cover:
 - conversation, delivery and redelivery
 - private and broadcast messages
 - files and folders arriving byte-identical

@@ -262,6 +262,13 @@ def call(method: str, url: str, token: Optional[str] = None, payload=None, data:
                 return raw, resp.headers
         except urllib.error.HTTPError as exc:
             raw = exc.read()
+            if exc.code in (502, 503, 504, 530):  # the tunnel in front of the hub is down or still starting
+                if time.monotonic() < deadline:
+                    time.sleep(3)
+                    continue
+                raise Fail(f"the session's link is not reachable right now (HTTP {exc.code} from the tunnel: the"
+                           " host's session is still starting or has stopped). Try again in a minute, or ask the"
+                           " host for the current link.") from None
             try:
                 detail = json.loads(raw.decode("utf-8")).get("error")
             except (ValueError, AttributeError):
@@ -706,11 +713,15 @@ def start_tunnel(port: int, on_url, on_fail) -> Optional[subprocess.Popen]:
     found: list[str] = []
 
     def read() -> None:
-        for line in proc.stdout:  # keep draining, or cloudflared blocks on a full pipe
-            m = TUNNEL_RE.search(line.decode("utf-8", "replace"))
-            if m and not found:
-                found.append(m.group(0))
-                on_url(m.group(0))
+        with open(home() / "tunnel.log", "w", encoding="utf-8", errors="replace") as log:
+            for line in proc.stdout:  # keep draining, or cloudflared blocks on a full pipe
+                text = line.decode("utf-8", "replace")
+                log.write(text)
+                log.flush()
+                m = TUNNEL_RE.search(text)
+                if m and not found:
+                    found.append(m.group(0))
+                    on_url(m.group(0))
         if not found:
             on_fail("cloudflared stopped before giving an address")
 
@@ -913,7 +924,7 @@ def cmd_host(a) -> int:
             if info.get("tunnel") in ("up", "failed"):
                 break
             time.sleep(0.5)
-        if info.get("tunnel") == "up" and not public_ready(info["public"], 90):
+        if info.get("tunnel") == "up" and not public_ready(info["public"], 150):
             info["tunnel_note"] = "the public link did not answer yet; it may need another minute or two"
     return print_host(info)
 
@@ -937,7 +948,7 @@ def public_ready(url: str, limit: float) -> bool:
         time.sleep(2)
     else:
         return False
-    try:
+    try:  # Cloudflare answers 530 until the tunnel is routed, which can take a minute or two
         call("GET", f"{url}/healthz", timeout=10, retry_for=max(5.0, deadline - time.monotonic()))
         return True
     except Fail:
