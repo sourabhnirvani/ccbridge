@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -500,7 +501,7 @@ def test_join_with_a_stale_invite_says_so(in_tmp, host, friend_project):
 
 
 def test_join_still_writes_settings_when_the_relay_is_unreachable(in_tmp, monkeypatch, capsys):
-    def unreachable(*args):
+    def unreachable(*args, **kwargs):
         raise bridge.RelayUnreachable("ConnectError")
 
     monkeypatch.setattr(bridge, "register_name", unreachable)
@@ -554,7 +555,7 @@ def test_bad_names_are_refused(in_tmp, name):
 
 
 def test_join_cli_writes_allowlist(in_tmp, monkeypatch):
-    monkeypatch.setattr(bridge, "register_name", lambda *args: None)
+    monkeypatch.setattr(bridge, "register_name", lambda *args, **kwargs: None)
     bridge.main(["join", encode_invite("https://x", "room1", "t"), "friend", "--allow", "sourabh"])
     assert settings(in_tmp)["CCBRIDGE_ALLOWED_PEERS"] == "sourabh"
 
@@ -715,3 +716,339 @@ def test_stop_signals_run_the_cleanup():
         with bridge._stop_on_signals():
             signal.raise_signal(signal.SIGTERM)
     assert signal.getsignal(signal.SIGTERM) == before
+
+
+# --- more AI tools: connect, --client, --local, --max-members ---------------------
+
+
+@pytest.fixture()
+def tools(in_tmp, tmp_path, monkeypatch):
+    """A scratch home folder, and no Codex CLI, so nothing outside tmp_path is touched."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(home))
+    monkeypatch.setenv("CODEX_HOME", "")
+    monkeypatch.delenv("CODEX_HOME")
+    real = bridge.find_program
+    monkeypatch.setattr(bridge, "find_program", lambda name: None if name == "codex" else real(name))
+    return home
+
+
+def client_settings(project, client):
+    return json.loads(bridge.client_settings_path(project, client).read_text(encoding="utf-8"))
+
+
+def test_host_with_no_client_flag_writes_exactly_what_it_did_before(in_tmp, host, tools):
+    host()
+    assert (in_tmp / ".mcp.json").exists()
+    assert sorted(p.name for p in bridge.PROJECTS_DIR.iterdir()) == [bridge.settings_path(in_tmp).name]
+    assert not (in_tmp / ".cursor").exists()
+    s = settings(in_tmp)
+    assert s["CCBRIDGE_NAME"] == "sourabh" and s["CCBRIDGE_CLIENT"] == "claude-code"
+    assert s["CCBRIDGE_PROJECT_DIR"] == str(in_tmp.resolve())
+
+
+def test_connect_gives_every_tool_its_own_name_and_settings(in_tmp, host, tools):
+    def connect_then_probe():
+        assert bridge.cmd_connect("cursor,grok,antigravity", None) == 0
+        key = settings(in_tmp)["CCBRIDGE_IDENTITY_KEY"]
+        seen = {n: join_as(in_tmp, n, key, register_only=True).status_code
+                for n in ("sourabh-cursor", "sourabh-grok", "sourabh-antigravity")}
+        seen["impostor"] = join_as(in_tmp, "sourabh-cursor", "some-other-key-0123456789",
+                                   register_only=True).status_code
+        return seen
+
+    # One identity key may own several names in a room; nobody else may take them.
+    assert host(while_up=connect_then_probe) == {"sourabh-cursor": 200, "sourabh-grok": 200,
+                                                  "sourabh-antigravity": 200, "impostor": 409}
+    files = {bridge.client_settings_path(in_tmp, c) for c in ("claude-code", "cursor", "grok", "antigravity")}
+    assert len(files) == 4
+    for client in ("cursor", "grok", "antigravity"):
+        s = client_settings(in_tmp, client)
+        assert s["CCBRIDGE_NAME"] == f"sourabh-{client}" and s["CCBRIDGE_CLIENT"] == client
+        assert s["CCBRIDGE_PROJECT_DIR"] == str(in_tmp.resolve())
+        assert s["CCBRIDGE_ROOM"] == settings(in_tmp)["CCBRIDGE_ROOM"]
+        assert "hosted" not in s
+    assert settings(in_tmp)["CCBRIDGE_NAME"] == "sourabh"  # Claude Code's is unchanged
+
+
+CLIENT_FILES = {"cursor": ".cursor/mcp.json", "vscode": ".vscode/mcp.json", "opencode": "opencode.jsonc",
+                "kiro": ".kiro/settings/mcp.json", "gemini": ".gemini/settings.json",
+                "grok": ".grok/config.toml", "codex": ".codex/config.toml",
+                "antigravity": ".agents/mcp_config.json", "devin": ".devin/mcp_config.json",
+                "amp": ".amp/settings.json", "junie": ".junie/mcp/mcp.json", "zed": ".zed/settings.json"}
+
+
+def windsurf_file(home):
+    path = home / ".codeium/windsurf/mcp_config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"mcpServers": {}}', encoding="utf-8")
+    return path
+
+
+def test_client_configs_hold_no_secret_and_name_their_own_settings(in_tmp, host, tools):
+    windsurf_file(tools)
+    host(while_up=lambda: bridge.cmd_connect(",".join(CLIENT_FILES) + ",windsurf", None))
+    token, key = settings(in_tmp)["CCBRIDGE_TOKEN"], settings(in_tmp)["CCBRIDGE_IDENTITY_KEY"]
+    written = {c: in_tmp / f for c, f in CLIENT_FILES.items()}
+    written["windsurf"] = tools / ".codeium/windsurf/mcp_config.json"
+    for client, path in written.items():
+        text = path.read_text(encoding="utf-8")
+        assert token not in text and key not in text, path
+        own = str(bridge.client_settings_path(in_tmp, client))
+        assert own in text or json.dumps(own)[1:-1] in text, path
+    ignored = (in_tmp / ".gitignore").read_text(encoding="utf-8").split()
+    for entry in [".mcp.json", *CLIENT_FILES.values()]:
+        assert entry in ignored
+
+
+def test_user_wide_entries_name_the_project(in_tmp, host, tools):
+    path = windsurf_file(tools)
+    host(while_up=lambda: bridge.cmd_connect("windsurf", None))
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    (name,) = servers
+    assert re.fullmatch(r"ccbridge_[a-z0-9]+(?:_[a-z0-9]+)*", name) and len(name) <= 29
+    assert name.endswith("_" + bridge.settings_path(in_tmp).stem[-12:][:6])
+    assert servers[name]["env"] == {"CCBRIDGE_CONFIG": str(bridge.client_settings_path(in_tmp, "windsurf"))}
+
+
+def test_connect_name_override(in_tmp, host, tools):
+    host(while_up=lambda: bridge.cmd_connect("cursor", "reviewer"))
+    assert client_settings(in_tmp, "cursor")["CCBRIDGE_NAME"] == "reviewer"
+
+
+def test_connect_before_host_or_join_says_what_to_do(in_tmp, tools):
+    with pytest.raises(SetupError, match="not on a bridge yet"):
+        bridge.cmd_connect("cursor", None)
+
+
+def test_a_name_too_long_with_the_client_suffix_is_refused(in_tmp, tools):
+    with pytest.raises(SetupError, match="pick a shorter one with --name"):
+        bridge._client_names("x" * 60, ["antigravity"])
+
+
+def test_connect_into_a_locked_room_explains_the_lock(in_tmp, host, tools):
+    def connect_cursor():
+        with pytest.raises(SetupError, match="--client cursor"):
+            bridge.cmd_connect("cursor", None)
+
+    host(allow="alex", while_up=connect_cursor)
+
+
+def test_host_with_clients_lets_them_into_its_locked_room(in_tmp, host, tools, monkeypatch):
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", "alex", clients=["claude-code", "cursor"])
+    assert client_settings(in_tmp, "cursor")["CCBRIDGE_NAME"] == "sourabh-cursor"
+    assert (in_tmp / ".mcp.json").exists() and (in_tmp / ".cursor/mcp.json").exists()
+
+
+def test_with_an_allowlist_a_projects_tools_still_hear_each_other(in_tmp, host, tools, monkeypatch):
+    from ccbridge import mcp_server
+
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", "alex", clients=["claude-code", "cursor"])
+    # A tool connected later is added to the earlier tools' lists too.
+    s = settings(in_tmp)
+    bridge.write_client(in_tmp, "grok", "sourabh-grok", s)
+    bridge._sync_allowed_peers(in_tmp)
+
+    def peers_of(client):
+        monkeypatch.setenv("CCBRIDGE_CONFIG", str(bridge.client_settings_path(in_tmp, client)))
+        return mcp_server.allowed_peers()
+
+    assert peers_of("claude-code") == {"alex", "sourabh-cursor", "sourabh-grok"}
+    assert peers_of("cursor") == {"alex", "sourabh", "sourabh-grok"}
+    assert peers_of("grok") == {"alex", "sourabh", "sourabh-cursor"}
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_tracked_tool_config_is_pointed_out(in_tmp, tools):
+    subprocess.run(["git", "init", "-q"], cwd=in_tmp, check=True)
+    (in_tmp / "opencode.json").write_text('{"theme": "x"}', encoding="utf-8")
+    subprocess.run(["git", "add", "opencode.json"], cwd=in_tmp, check=True)
+    notes = bridge.client_config_warnings(in_tmp, {"opencode": in_tmp / "opencode.json",
+                                                   "cursor": in_tmp / ".cursor/mcp.json"})
+    assert len(notes) == 1 and notes[0].startswith("opencode.json is tracked by git")
+
+
+def test_without_an_allowlist_none_is_added(in_tmp, host, tools):
+    host(while_up=lambda: bridge.cmd_connect("cursor", None))
+    assert "CCBRIDGE_ALLOWED_PEERS" not in client_settings(in_tmp, "cursor")
+    assert "CCBRIDGE_ALLOWED_PEERS" not in settings(in_tmp)
+
+
+def test_host_without_claude_code_leaves_mcp_json_alone(in_tmp, host, tools, monkeypatch):
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", None, clients=["cursor"])
+    assert not (in_tmp / ".mcp.json").exists()
+    assert client_settings(in_tmp, "cursor")["CCBRIDGE_NAME"] == "sourabh-cursor"
+    assert settings(in_tmp)["hosted"]  # the project's record is kept all the same
+
+
+def test_join_with_clients(in_tmp, host, tools, friend_project):
+    def join_with_two():
+        invite = invite_for(in_tmp)
+        friend = friend_project()
+        assert bridge.cmd_join(invite, "alex", None, clients=["claude-code", "opencode"]) == 0
+        return friend
+
+    friend = host(while_up=join_with_two)
+    assert json.loads((friend / "opencode.jsonc").read_text(encoding="utf-8"))["mcp"]["ccbridge"]["type"] == "local"
+    assert client_settings(friend, "opencode")["CCBRIDGE_NAME"] == "alex-opencode"
+    assert settings(friend)["CCBRIDGE_NAME"] == "alex"
+
+
+def test_host_local_never_starts_a_tunnel(in_tmp, tools, monkeypatch, capsys):
+    def no_tunnel(port=0):
+        raise AssertionError("--local must not start cloudflared")
+
+    monkeypatch.setattr(bridge, "start_tunnel", no_tunnel)
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", None, local=True)
+    assert "LOCAL ONLY (--local)" in capsys.readouterr().out
+
+
+def test_max_members_needs_a_relay_that_supports_it(in_tmp):
+    import inspect
+
+    from ccbridge import relay
+
+    if "max_members" in inspect.signature(relay.create_app).parameters:
+        pytest.skip("this relay already supports max_members")
+    with pytest.raises(SetupError, match="no member limit"):
+        bridge.build_relay("room1", "t" * 20, None, max_members=5)
+
+
+def test_max_members_is_passed_to_the_relay(in_tmp, monkeypatch):
+    from ccbridge import relay
+
+    seen = {}
+
+    def create_app(db_path, open_rooms=None, rooms=None, allowed_names=None, max_members=None):
+        seen["max_members"] = max_members
+        return "app"
+
+    monkeypatch.setattr(relay, "create_app", create_app)
+    assert bridge.build_relay("room1", "t" * 20, None, max_members=5) == "app"
+    assert seen == {"max_members": 5}
+
+
+@pytest.fixture()
+def links(monkeypatch):
+    """A relay with join links, as on the hub branch: invite_codes and POST /v1/invite."""
+    from fastapi import HTTPException
+
+    from ccbridge import relay
+
+    real = relay.create_app
+
+    def create_app(db_path, open_rooms=None, rooms=None, allowed_names=None, invite_codes=None):
+        app = real(db_path, open_rooms=open_rooms, rooms=rooms, allowed_names=allowed_names)
+        codes = {k.replace("-", "").upper(): v for k, v in (invite_codes or {}).items()}
+
+        @app.post("/v1/invite")
+        def invite(body: dict):
+            hit = codes.get(str(body.get("code", "")).replace("-", "").upper())
+            if not hit:
+                raise HTTPException(404, "Unknown join link")
+            return {"room": hit[0], "token": hit[1], "version": "test"}
+
+        return app
+
+    monkeypatch.setattr(relay, "create_app", create_app)
+
+
+def link_of():
+    return bridge.INVITE_FILE.read_text(encoding="utf-8").split()[3]
+
+
+def test_new_invite_code_shape():
+    for _ in range(50):
+        assert re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}", bridge.new_invite_code())
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("https://a-b-c.trycloudflare.com/j/7Q4K-M9XP", ("https://a-b-c.trycloudflare.com", "7Q4K-M9XP")),
+    ("https://a-b-c.trycloudflare.com/j/7Q4K-M9XP/", ("https://a-b-c.trycloudflare.com", "7Q4K-M9XP")),
+    ("  http://127.0.0.1:8787/j/7q4km9xp\n", ("http://127.0.0.1:8787", "7q4km9xp")),
+    ("https://example.com/relay/j/7Q4K-M9XP", ("https://example.com/relay", "7Q4K-M9XP")),
+    ("https://example.com/j/", None),
+    ("https://example.com/j/7Q4K-M9XP?x=1", None),
+    (bridge.encode_invite("https://x", "room1", "tok"), None),
+])
+def test_parse_join_link(text, expected):
+    assert bridge.parse_join_link(text) == expected
+
+
+def test_host_prints_a_join_link_and_keeps_it(in_tmp, host, links, capsys):
+    first = host(while_up=link_of)
+    assert not bridge.INVITE_FILE.exists()  # removed when the bridge stops
+    url = relay_of(in_tmp)[0]
+    assert re.fullmatch(re.escape(url) + r"/j/[0-9A-Z]{4}-[0-9A-Z]{4}", first)
+    assert f"Join link: {first}" in capsys.readouterr().out
+    code = first.rsplit("/", 1)[1]
+    assert host(while_up=link_of).rsplit("/", 1)[1] == code  # the same code next run
+    assert host(new_room=True, while_up=link_of).rsplit("/", 1)[1] != code
+
+
+def test_invite_file_has_the_link_first_and_the_full_invite_last(in_tmp, host, links):
+    text = host(while_up=lambda: bridge.INVITE_FILE.read_text(encoding="utf-8"))
+    first, last = text.splitlines()
+    assert "/j/" in first and first.endswith("<theirname>")
+    assert bridge.decode_invite(last.split()[3])[1] == settings(in_tmp)["CCBRIDGE_ROOM"]
+
+
+def test_join_with_a_link(in_tmp, host, links, friend_project):
+    def join_by_link():
+        link = link_of() + "/"
+        friend = friend_project()
+        assert bridge.cmd_join(link, "alex", None) == 0
+        return friend
+
+    friend = host(while_up=join_by_link)
+    assert settings(friend)["CCBRIDGE_ROOM"] == settings(in_tmp)["CCBRIDGE_ROOM"]
+    assert settings(friend)["CCBRIDGE_NAME"] == "alex"
+
+
+def test_join_with_an_unknown_link_says_so(in_tmp, host, links, friend_project):
+    def join_with_wrong_code():
+        base = link_of().rsplit("/", 2)[0]
+        friend = friend_project()
+        with pytest.raises(SetupError, match="join link is not valid"):
+            bridge.cmd_join(f"{base}/j/ZZZZ-ZZZZ", "alex", None)
+        return friend
+
+    friend = host(while_up=join_with_wrong_code)
+    assert not (friend / ".mcp.json").exists()
+
+
+def test_join_with_a_link_when_no_bridge_answers(in_tmp, capsys):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]  # closed again before the join
+    code = bridge.cmd_join(f"http://127.0.0.1:{port}/j/7Q4K-M9XP", "alex", None)
+    assert code == bridge.EXIT_UNREACHABLE
+    assert "Nothing was saved" in capsys.readouterr().out
+    assert not (in_tmp / ".mcp.json").exists()
+
+
+def test_no_link_from_a_relay_without_join_links(in_tmp, host):
+    if bridge._relay_accepts("invite_codes"):
+        pytest.skip("this relay has join links")
+    text = host(while_up=lambda: bridge.INVITE_FILE.read_text(encoding="utf-8"))
+    assert len(text.splitlines()) == 1 and "/j/" not in text
+
+
+def test_clients_command_lists_every_client(in_tmp, tools, capsys):
+    bridge.main(["clients"])
+    out = capsys.readouterr().out
+    for slug in bridge.CLIENTS:
+        assert slug in out
+
+
+def test_unknown_client_is_a_friendly_error(in_tmp, tools, capsys):
+    with pytest.raises(SystemExit) as exit_:
+        bridge.main(["connect", "--client", "emacs"])
+    assert exit_.value.code == 1
+    assert "unknown client 'emacs'" in capsys.readouterr().err
