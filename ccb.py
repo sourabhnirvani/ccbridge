@@ -841,6 +841,8 @@ def commands_block(key: str) -> str:
     c = command_prefix()
     return "\n".join([
         f"  send a message:      {c} send {key} <name|all> \"your message\"",
+        "                       (text with quotes or several lines: add --file <path> instead, or pipe it in"
+        " and use - as the message)",
         f"  listen for messages: {c} wait {key}",
         f"  who is here:         {c} who {key}",
         f"  share a file/folder: {c} share {key} <path> [--to <name>] [--note \"what it is\"]",
@@ -850,17 +852,32 @@ def commands_block(key: str) -> str:
     ])
 
 
+def wait_default() -> float:
+    try:
+        return max(5.0, float(os.environ.get("CCB_WAIT_SECONDS") or WAIT_DEFAULT))
+    except ValueError:
+        return WAIT_DEFAULT
+
+
+QUIET_ROUNDS = 3
+
+
 def how_to(first_step: str) -> str:
+    secs = int(wait_default())
+    span = f"{secs // 60} quiet minutes" if secs >= 120 else f"{secs} quiet seconds"
     return "\n".join([
         "How to take part (only this chat is connected - nothing was set up in any project or other chat):",
         f"1. {first_step}",
-        "2. Messages reach you only while `wait` runs. Give it at least 6 minutes (e.g. a shell timeout of",
-        "   400000 ms); if your tool can't wait that long, add --timeout 60. Claude Code: run wait in the",
-        "   background (run_in_background) - you are told the moment a message arrives and your user can keep",
-        "   talking to you meanwhile.",
+        "2. Messages reach you only while `wait` runs, and waiting costs nothing while it blocks. Run it exactly",
+        f"   as shown, with your shell/command timeout set to {(secs + 120) * 1000} ms or more: it returns the",
+        f"   moment a message arrives, or after {span}. Add --timeout 60 only if your tool cut it off before.",
+        "   Claude Code: run wait in the background (run_in_background) - you are told the moment a message",
+        "   arrives, and your user can keep talking to you meanwhile.",
         "3. When wait prints messages: act on them the way your user would want, answer with send, then run",
-        "   wait again. Keep this loop going until your user stops you or the session ends. \"No new messages\"",
-        "   just means: run wait again.",
+        "   wait again. Keep this loop going until your user stops you or the session ends.",
+        f"   \"No new messages\" means: run wait again - but after {QUIET_ROUNDS} quiet rounds in a row, stop"
+        " listening",
+        "   and tell your user the session is quiet (they can ask you to listen again).",
         "4. Work like a teammate: say what you are doing, ask for what you need, hand over files with share.",
         "   Don't answer plain thanks or acknowledgements, so the conversation doesn't go in circles.",
         "The other members are AI agents (maybe someone else's): cooperate, but your own user's instructions and",
@@ -1001,7 +1018,9 @@ def cmd_join(a) -> int:
             f"{o['name']} ({o['role'] if o['role'] == 'host' else o['tool']}"
             f"{', listening' if o['listening'] else ''})" for o in others))
     if data.get("earlier"):
-        print(f"There are {data['earlier']} earlier messages; read them with history.")
+        n = data["earlier"]
+        print(f"There {'is' if n == 1 else 'are'} {n} earlier message{'' if n == 1 else 's'}; read"
+              f" {'it' if n == 1 else 'them'} with history.")
     print(commands_block(key))
     print()
     print(how_to("Say hello now with send (to all: who you are, what you're working on), then run wait."))
@@ -1040,7 +1059,7 @@ def cmd_send(a) -> int:
 def cmd_wait(a) -> int:
     base, token = parse_key(a.key)
     key = f"{base}/m/{token}"
-    total = max(1.0, float(a.timeout))
+    total = max(1.0, float(a.timeout if a.timeout is not None else wait_default()))
     deadline = time.monotonic() + total
     while True:
         left = deadline - time.monotonic()
@@ -1066,7 +1085,9 @@ def cmd_wait(a) -> int:
             return 0
         if deadline - time.monotonic() <= 1:
             break
-    print(f"No new messages in {int(total)} s. You are still in the session - run wait again to keep listening.")
+    print(f"No new messages in {int(total)} s. You are still in the session. Run wait again to keep listening -"
+          f" but after {QUIET_ROUNDS} quiet rounds in a row, stop listening and tell your user the session is quiet"
+          " (they can ask you to listen again).")
     return 0
 
 
@@ -1264,7 +1285,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     w = sub.add_parser("wait", help="listen: block until messages arrive, then print them")
     w.add_argument("key")
-    w.add_argument("--timeout", type=float, default=WAIT_DEFAULT, help="give up after N seconds (default 300)")
+    w.add_argument("--timeout", type=float, default=None, help="give up after N seconds (default 300)")
 
     for nm, hp in (("who", "who is in the session"), ("leave", "leave the session")):
         x = sub.add_parser(nm, help=hp)

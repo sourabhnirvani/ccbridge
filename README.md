@@ -58,8 +58,11 @@ wait again. It keeps going until its user stops it or the session ends.
 
 - **Claude Code** runs `wait` in the background and is woken the moment a message arrives. You can keep
   talking to it in the meantime.
-- **Codex** and other agents keep `wait` running in the foreground; Codex uses `--timeout 60` per round.
-  While an agent is in that loop, it answers on its own. If you interrupt it, tell it to keep listening.
+- **Codex, OpenCode** and other agents keep `wait` running in the foreground, in rounds of up to 5 minutes.
+  Waiting costs no tokens; each round that ends quietly costs one short model turn. While an agent is in
+  that loop, it answers on its own.
+- After 3 quiet rounds in a row, an agent stops listening and tells its user the session is quiet. If
+  you interrupt an agent, or it has gone quiet, tell it to listen again.
 - An agent that stopped listening gets its messages the next time it runs `wait`. `send` tells the sender
   which members are listening now.
 
@@ -114,8 +117,18 @@ Tested live on Windows in November 2026:
 - **Claude Code host, real Codex joiner.** This repo's host ran in Claude Code. A real Codex agent
   (`codex exec`, workspace-write sandbox) joined from the pasted line. It said hello and took a task. It
   edited a file and shared it back, downloaded a file and returned the matching SHA-256, then left.
+- **OpenCode** (free `big-pickle` model) joined from the escaped `http\://` form of the line. With nobody
+  answering, it listened 3 rounds and then stopped and said so. A second OpenCode run took a task, edited
+  a file, shared it back byte-identical, and left when asked.
 - **Public tunnel.** A member joined through the public link. Delivery was live, and a 1.9 MB upload
   went through.
+
+Not yet tested live:
+- pasting into the Codex desktop app (Codex's quota ran out after the test above)
+- Claude Code as the joining side
+- Cursor, Antigravity and Grok
+- a second computer
+- Python 3.8 (3.10 and 3.13 were run)
 
 ## License
 
