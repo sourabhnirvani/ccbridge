@@ -1114,10 +1114,11 @@ def print_host(info: dict) -> int:
     print()
     print("=" * 100)
     print("PASTE THIS into the agent chat of another IDE on THIS computer:\n")
-    print(f"Join my ccbridge session: {c} join {local_link}\n")
+    print(f"Join my ccbridge session: run  {c} join {local_link}  then stay in the session: say hello and keep"
+          " listening and answering, exactly as join tells you.\n")
     if public:
         print("For an IDE on ANOTHER computer, paste this instead (it needs Python 3.8+, nothing else):\n")
-        print(f"Join my ccbridge session: download {public}/ccb.py and run: python ccb.py join {public}/j/{info['code']}")
+        print(f"Join my ccbridge session: download {public}/ccb.py and run  python ccb.py join {public}/j/{info['code']}  then stay in the session: say hello and keep listening and answering, exactly as join tells you.")
         if info.get("tunnel_note"):
             print(f"  ({info['tunnel_note']})")
     else:

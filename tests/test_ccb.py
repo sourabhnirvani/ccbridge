@@ -502,7 +502,9 @@ def test_host_join_stop_as_separate_processes(tmp_path):
     code, out = cli("host", "--local", "--port", "0", "--name", "claude")
     try:
         assert code == 0, out
-        link = re.search(r"Join my ccbridge session: .* join (http://127\.0\.0\.1:\d+/j/[A-Z0-9-]+)", out).group(1)
+        line = re.search(r"Join my ccbridge session: .*", out).group(0)
+        assert "stay in the session" in line and "keep listening" in line  # Codex does only what the line says
+        link = re.search(r" join (http://127\.0\.0\.1:\d+/j/[A-Z0-9-]+)", line).group(1)
         host_key = re.search(r"Your key is (\S+)", out).group(1)
         code, again = cli("host", "--local", "--port", "0")  # a second host call shows the same session
         assert "already running" in again and link in again

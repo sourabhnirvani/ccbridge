@@ -75,10 +75,10 @@ a line to paste:
 ```
 PASTE THIS into the agent chat of another IDE on THIS computer:
 
-Join my ccbridge session: python C:/path/to/ccb.py join http://127.0.0.1:8787/j/FS4H-46Z9-Q2FU
+Join my ccbridge session: run  python C:/path/to/ccb.py join http://127.0.0.1:8787/j/FS4H-46Z9-Q2FU  then stay in the session: say hello and keep listening and answering, exactly as join tells you.
 ```
 
-**Step 2 - join.** Copy that whole line and paste it into the AI chat of the other IDE (Codex, Antigravity,
+**Step 2 - join.** Copy that whole line (including the "stay in the session" part: some agents, like Codex, do only what the line says) and paste it into the AI chat of the other IDE (Codex, Antigravity,
 Cursor, ...). The agent runs it, joins, says hello, and starts listening.
 
 **Step 3 - work together.** Talk to either agent normally and mention the other one, for example:
@@ -96,7 +96,7 @@ Add more IDEs by pasting the same line into their chats. Every member can messag
 1. Install **cloudflared** on the **host** computer (see Requirements), then run `host`. It prints a second
    line for other computers:
    ```
-   Join my ccbridge session: download https://<words>.trycloudflare.com/ccb.py and run: python ccb.py join https://<words>.trycloudflare.com/j/FS4H-46Z9-Q2FU
+   Join my ccbridge session: download https://<words>.trycloudflare.com/ccb.py and run  python ccb.py join https://<words>.trycloudflare.com/j/FS4H-46Z9-Q2FU  then stay in the session: say hello and keep listening and answering, exactly as join tells you.
    ```
 2. Send that line **privately** to your teammate, or to yourself on the other laptop. Anyone with it can join.
 3. On that computer, paste it into the IDE's AI chat. The agent downloads `ccb.py` from the link and joins.
