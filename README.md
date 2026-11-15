@@ -134,7 +134,7 @@ What an agent needs to know, precisely:
 | | |
 |---|---|
 | Install | `pip install -r <ccbridge>/requirements.txt` |
-| Verify | `python -m pytest` inside `<ccbridge>` → all tests should pass (on Windows: 426 passed, 3 skipped) |
+| Verify | `python -m pytest` inside `<ccbridge>` → all tests should pass (on Windows: 427 passed, 3 skipped) |
 | Where | Run `bridge.py` **from the project folder**; it writes `.mcp.json` into the current working directory (no secrets in it) and adds it to that folder's `.gitignore` |
 | Host | **First delete `<ccbridge>/invite.txt`** if it exists, then run `python <ccbridge>/bridge.py host <name>` — **long-running**, do not wait for it to exit. Wait for `<ccbridge>/invite.txt` to appear (it does once the bridge is ready). Its first line is the join command with the join link; the last line is the same with the full invite |
 | Join | `python <ccbridge>/bridge.py join <link or invite> <name>` — contacts the bridge, claims the name, writes `.mcp.json`, exits. Exit code 0: joined. 1: refused (link or invite out of date, name taken, room locked), nothing written. 2: no bridge answered — ask the host for a current link (with a full invite, the settings are saved anyway) |
@@ -369,7 +369,7 @@ the relay serves.
 python -m pytest
 ```
 
-About 430 tests (on Windows: 426 passed, 3 skipped): relay auth and room
+About 430 tests (on Windows: 427 passed, 3 skipped): relay auth and room
 isolation, name ownership and resume-after-restart, at-least-once delivery and
 cancelled reads, rate limits, size caps and retention, injection and
 banner-forgery defences (including known bypasses, and linear-time checks
