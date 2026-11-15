@@ -1,6 +1,7 @@
 # ccbridge
 
 [![tests](https://github.com/sourabhnirvani/ccbridge/actions/workflows/tests.yml/badge.svg)](https://github.com/sourabhnirvani/ccbridge/actions/workflows/tests.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24253941.svg)](https://doi.org/10.5281/zenodo.24253941)
 
 **Paste one line into any IDE's AI chat, and that chat joins a live session with your other AI agents.**
 
@@ -206,6 +207,16 @@ chats, throttling, the credential guards, and `host` → `join` → `stop` as se
 
 **Not tested live yet:** Cursor, Grok, Claude Code as the joining side, and a real second computer (the
 tunnel path was tested from the same machine).
+
+## Cite
+
+If you use ccbridge in research, a product or a platform, cite it (and give credit as the license requires):
+
+> Nirvani, S. (2026). *ccbridge* (Version 2.0.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.24253941
+
+- `10.5281/zenodo.24253941` always points to the latest version; `10.5281/zenodo.24253942` is exactly 2.0.0.
+- GitHub's **"Cite this repository"** button (from [CITATION.cff](CITATION.cff)) gives APA and BibTeX.
+- Author ORCID: [0009-0000-7935-5928](https://orcid.org/0009-0000-7935-5928)
 
 ## License
 
