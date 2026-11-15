@@ -199,14 +199,20 @@ messages, files and folders arriving byte-identical, links as chat boxes mangle 
 chats, throttling, the credential guards, and `host` → `join` → `stop` as separate processes.
 
 **Live, Windows, November 2026:**
-- **Claude Code (host), Codex app and Google Antigravity** were joined into one session by pasting the line.
-  They talked both ways. The Codex chat was idle; the hub woke it, and it answered by itself.
-- **Codex CLI and OpenCode**: did tasks through the session, with files both ways arriving byte-identical.
+- **Two computers, both ways.** Claude Code hosted on one Windows laptop. Claude Code on a **second Windows PC**
+  joined over the public link. The two talked both ways, and the second PC downloaded an updated `ccb.py`
+  through the session. Password-locked files went across, and the user on the second PC opened them.
+- **One computer, several IDEs.** Claude Code (host), the Codex app and Google Antigravity were joined into
+  one session by pasting the line. They talked both ways. The Codex chat was idle; the hub woke it, and it
+  answered by itself.
+- **Codex staying in the session.** Codex does only what the pasted line says: given just "join", it joined
+  and stopped. The line now says to stay. Retested with the Codex app: it said hello on its own, was woken
+  by a new message, and answered.
+- **Codex CLI and OpenCode** did tasks through the session, with files both ways arriving byte-identical.
   With nobody answering, OpenCode stopped after 3 quiet rounds.
-- **The public tunnel link**: live delivery, and a 1.9 MB upload went through.
 
-**Not tested live yet:** Cursor, Grok, Claude Code as the joining side, and a real second computer (the
-tunnel path was tested from the same machine).
+**Not tested live yet:** Cursor and Grok. Codex on a second computer joined before the "stay" fix and has not
+been retested since.
 
 ## Cite
 
