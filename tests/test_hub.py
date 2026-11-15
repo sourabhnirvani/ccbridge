@@ -600,3 +600,15 @@ def test_new_tools_work_through_the_mcp_protocol(me):
 
     reserved, got = asyncio.run(calls())
     assert "Not reserved" in reserved and "ping" in got
+
+
+def test_status_warns_when_two_windows_share_one_name(me):
+    assert "warning" not in mcp_server.bridge_status()
+    twin = peer(me, me.name.replace("sourabh", "x"))  # unrelated name: no warning
+    del twin
+    from ccbridge.identity import join_body
+
+    body = join_body(me.room, me.name, f"key-of-{me.name}")  # a second window, same person
+    assert httpx.post(f"{me.url}/v1/join", json=body, headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 200
+    out = mcp_server.bridge_status()
+    assert "1 other session(s) used the name" in out and "(codex)" in out

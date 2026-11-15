@@ -498,16 +498,25 @@ def bridge_status() -> str:
     except NotConfigured as exc:
         return f"Not configured: {exc}"
     try:
-        _client.request("POST", "/v1/heartbeat")
+        beat = _client.request("POST", "/v1/heartbeat")
     except Exception as exc:  # noqa: BLE001 - surface any connection problem as text
         return f"Configured for room '{room}' at {url} as '{name}', but not reachable: {exc}"
     allow = allowed_peers()
+    client = safe_client(setting_or_empty("CCBRIDGE_CLIENT"))
     lines = [
         f"Connected to {url}",
         f"room: {room}",
-        f"you are: {name}",
+        f"you are: {name}" + (f" ({client})" if client else ""),
         f"peer allowlist: {', '.join(sorted(allow)) if allow else '(none - any peer in the room)'}",
     ]
+    twins = beat.get("other_sessions")
+    if _is_int(twins) and twins > 0:
+        lines.append(
+            f"warning: {twins} other session(s) used the name '{name}' in the last minute. If you"
+            " just restarted, ignore this. Otherwise another window of this tool is running the"
+            " bridge under the same name: both of you receive the same direct messages and"
+            " tasks - coordinate before acting, or give one of them its own name."
+        )
     relay_version = _client.relay_version
     if relay_version != __version__:
         lines.append(

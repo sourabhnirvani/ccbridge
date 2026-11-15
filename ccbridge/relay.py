@@ -885,10 +885,17 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None,
         ack: Optional[int] = Query(default=None, ge=0, le=MAX_ID),
         who: Caller = Depends(caller),
     ) -> dict:
-        if ack is not None:
-            with lock:
+        with lock:
+            if ack is not None:
                 _ack(who, ack)
-        return {"ok": True, "display_name": who.display_name}
+            # Other live sessions under this same name: two windows of one tool,
+            # say, which would both answer the same direct messages and tasks.
+            twins = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE room = ? AND display_name = ?"
+                " AND session_id != ? AND last_seen > ?",
+                (who.room, who.display_name, who.session_id,
+                 time.time() - PRESENCE_TTL_SECONDS / 2)).fetchone()[0]
+        return {"ok": True, "display_name": who.display_name, "other_sessions": twins}
 
     @app.post("/v1/status")
     def set_status(req: StatusRequest, who: Caller = Depends(caller)) -> dict:
