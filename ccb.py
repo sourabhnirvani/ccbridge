@@ -196,6 +196,8 @@ def detect_tool() -> str:
         return "codex"
     if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT"):
         return "claude"
+    if any(k.startswith("ANTIGRAVITY_") for k in env):
+        return "antigravity"
     if any(k.startswith("GROK_") for k in env):
         return "grok"
     if env.get("OPENCODE") or any(k.startswith("OPENCODE_") for k in env):
