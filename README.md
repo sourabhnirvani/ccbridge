@@ -46,7 +46,7 @@ cd path/to/your-project
 python path/to/ccbridge/bridge.py host <yourname>
 ```
 
-It claims your name, prints a single invite line and keeps running. **Leave that
+It claims your name, prints a join link and keeps running. **Leave that
 window open — it is the relay.** Each project gets a room of its own, and keeps it
 every time you host from there (even if you move or rename the folder; a copy of
 the folder gets its own); `--new-room` starts over with a fresh room and
@@ -54,12 +54,19 @@ token (say, if an invite leaked).
 
 ```
 ============================================================
-SEND THIS ONE LINE TO YOUR FRIEND (privately - it holds the room token):
+SEND THIS LINK TO YOUR FRIEND (privately - it lets them into the room):
 
+  Join link: https://abc-def-ghi.trycloudflare.com/j/7Q4K-M9XP
+
+They run:  python bridge.py join <the link> <theirname>
+(or open the link: it shows the steps, which they can also hand to
+ their AI agent). The full invite works too:
   python bridge.py join eyJ1IjoiaHR0cHM6Ly9hYmMtZGVm... <theirname>
-
 ============================================================
 ```
+
+The link stays the same every time you host from this project (until
+`--new-room`); only the tunnel address in front of it changes between runs.
 
 ### The other person joins
 
@@ -68,13 +75,17 @@ git clone https://github.com/sourabhnirvani/ccbridge
 pip install -r ccbridge/requirements.txt
 
 cd path/to/your-copy-of-the-project
-python path/to/ccbridge/bridge.py join <the-invite-they-sent-you> <yourname>
+python path/to/ccbridge/bridge.py join <the-link-they-sent-you> <yourname>
 ```
 
-Send the invite privately (Signal, a password manager). It contains the room token.
+Send the link privately (Signal, a password manager): anyone holding it can join
+the room while the bridge runs. The longer invite string works in its place.
 
 `join` contacts the bridge and claims your name right away, so a taken name or an
-out-of-date invite shows up here rather than later inside Claude Code.
+out-of-date link shows up here rather than later inside Claude Code.
+
+Using Cursor, Codex, Grok, VS Code or another AI tool, or several at once? Each
+joins as a member of its own - see [docs/CLIENTS.md](docs/CLIENTS.md).
 
 ### Both of you
 
@@ -103,8 +114,8 @@ Paste this prompt, from inside the project you want to collaborate on:
 > Clone https://github.com/sourabhnirvani/ccbridge somewhere outside this project and
 > install its requirements. Then, **from this project's folder**, set up the bridge.
 > I am the **host** — run `python <ccbridge>/bridge.py host <myname>` and give me the
-> invite line it prints.
-> (Or: I am **joining** — run `python <ccbridge>/bridge.py join <invite> <myname>`.)
+> join link it prints.
+> (Or: I am **joining** — run `python <ccbridge>/bridge.py join <link> <myname>`.)
 > Then tell me to restart Claude Code and approve the ccbridge MCP server.
 
 What an agent needs to know, precisely:
@@ -112,10 +123,11 @@ What an agent needs to know, precisely:
 | | |
 |---|---|
 | Install | `pip install -r <ccbridge>/requirements.txt` |
-| Verify | `python -m pytest` inside `<ccbridge>` → 261 tests should pass (on Windows, 260 and 1 skipped) |
+| Verify | `python -m pytest` inside `<ccbridge>` → 388 tests should pass (on Windows, 387 and 1 skipped) |
 | Where | Run `bridge.py` **from the project folder**; it writes `.mcp.json` into the current working directory (no secrets in it) and adds it to that folder's `.gitignore` |
-| Host | **First delete `<ccbridge>/invite.txt`** if it exists, then run `python <ccbridge>/bridge.py host <name>` — **long-running**, do not wait for it to exit. Wait for `<ccbridge>/invite.txt` to appear (it does once the bridge is ready) and read the invite from there |
-| Join | `python <ccbridge>/bridge.py join <invite> <name>` — contacts the bridge, claims the name, writes `.mcp.json`, exits. Exit code 0: joined. 1: refused (name taken, invite out of date, room locked), nothing written. 2: no bridge answered — settings saved anyway, but ask the host for a current invite |
+| Host | **First delete `<ccbridge>/invite.txt`** if it exists, then run `python <ccbridge>/bridge.py host <name>` — **long-running**, do not wait for it to exit. Wait for `<ccbridge>/invite.txt` to appear (it does once the bridge is ready). Its first line is the join command with the join link; the last line is the same with the full invite |
+| Join | `python <ccbridge>/bridge.py join <link or invite> <name>` — contacts the bridge, claims the name, writes `.mcp.json`, exits. Exit code 0: joined. 1: refused (link or invite out of date, name taken, room locked), nothing written. 2: no bridge answered — ask the host for a current link (with a full invite, the settings are saved anyway) |
+| Other tools | `python <ccbridge>/bridge.py connect --client cursor,codex` after host/join, or `--client` on host/join; `bridge.py clients` lists them (see docs/CLIENTS.md) |
 | Then | Claude Code must be **restarted** in the project folder, and the `ccbridge` MCP server **approved** when it asks |
 
 `host` blocks forever by design — it is the relay process. Run it in a background
@@ -314,7 +326,7 @@ the relay serves.
 python -m pytest
 ```
 
-261 tests: relay auth and room isolation, name ownership and resume-after-restart,
+388 tests: relay auth and room isolation, name ownership and resume-after-restart,
 at-least-once delivery and cancelled reads, rate limits, size caps and retention,
 injection and banner-forgery defences (including known bypasses, and linear-time
 checks against a CPU-exhaustion attack), outbound credential checks, a hostile

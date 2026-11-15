@@ -1,16 +1,16 @@
 import json
-import subprocess
+import re
 import sys
 
 import pytest
 
-from ccbridge import clients
-from ccbridge.clients import CLIENTS, ClientError, config_path, parse_clients, register, server_name
+from ccbridge.clients import (CLIENTS, STYLES, TOML_EXTRA, ClientError, config_path,
+                              parse_clients, register, server_name)
 
 CMD, ARGS = "C:/Python/python.exe", ["C:/ccbridge/run_mcp_server.py"]
 ENV = {"CCBRIDGE_CONFIG": "C:/ccbridge/.ccbridge_projects/p-1234-cursor.json"}
-JSON_CLIENTS = [s for s, c in CLIENTS.items() if c.style != "toml"]
-TOML_CLIENTS = [s for s, c in CLIENTS.items() if c.style == "toml"]
+JSON_CLIENTS = [s for s, c in CLIENTS.items() if c.style in STYLES and not c.only_if_exists]
+TOML_CLIENTS = [s for s, c in CLIENTS.items() if c.style in TOML_EXTRA]
 tomllib = pytest.importorskip("tomllib") if sys.version_info >= (3, 11) else None
 
 
@@ -21,9 +21,6 @@ def home(tmp_path, monkeypatch):
     home.mkdir()
     for var in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(var, str(home))
-    for var in ("APPDATA", "XDG_CONFIG_HOME", "CODEX_HOME"):
-        monkeypatch.setenv(var, str(home / var.lower()))
-        monkeypatch.delenv(var)
     return home
 
 
@@ -39,22 +36,30 @@ def no_programs(name):
 
 
 def put(client, project, name="ccbridge", env=ENV):
-    return register(CLIENTS[client], project, name, CMD, ARGS, env, no_programs)[0]
+    return register(CLIENTS[client], project, name, CMD, ARGS, env)[0]
 
 
 def entries(client, path):
-    """The ccbridge-relevant servers in ``client``'s file, as {name: (command, args, env)}."""
+    """The servers in ``client``'s file, as {name: (command, args, env)}."""
     spec = CLIENTS[client]
     text = path.read_text(encoding="utf-8")
-    if spec.style == "toml":
-        data = tomllib.loads(text)["mcp_servers"] if tomllib else None
-        return {k: (v["command"], v["args"], v["env"]) for k, v in data.items()} if data else None
-    data = json.loads(text)
-    if spec.style == "vscode":
-        return {k: (v["command"], v["args"], v["env"]) for k, v in data["servers"].items()}
+    if spec.style in TOML_EXTRA:
+        if not tomllib:
+            return None
+        data = tomllib.loads(text)["mcp_servers"]
+        return {k: (v["command"], v["args"], v["env"]) for k, v in data.items()}
+    key, env_key = STYLES[spec.style]
+    data = json.loads(text)[key]
     if spec.style == "opencode":
-        return {k: (v["command"][0], v["command"][1:], v["environment"]) for k, v in data["mcp"].items()}
-    return {k: (v["command"], v["args"], v["env"]) for k, v in data["mcpServers"].items()}
+        return {k: (v["command"][0], v["command"][1:], v[env_key]) for k, v in data.items()}
+    return {k: (v["command"], v["args"], v[env_key]) for k, v in data.items()}
+
+
+def make(client, project, text):
+    path = config_path(CLIENTS[client], project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text if isinstance(text, bytes) else text.encode())
+    return path
 
 
 # --- the table -------------------------------------------------------------------
@@ -63,17 +68,27 @@ def entries(client, path):
 def test_every_client_has_a_known_style_and_a_path_template():
     for slug, spec in CLIENTS.items():
         assert spec.slug == slug
-        assert spec.style in ("mcpServers", "vscode", "opencode", "toml")
-        assert spec.path.startswith(("{project}/", "~/", "{codex_home}/"))
+        assert spec.style in STYLES or spec.style in TOML_EXTRA
+        assert all(t.startswith(("{project}/", "~/")) for t in spec.path.split("|"))
         assert spec.source in ("tested", "docs")
 
 
-def test_paths_resolve_at_call_time(project, home, monkeypatch):
+def test_only_windsurf_is_user_wide():
+    # A user-wide entry starts in every project's window: two windows, one name.
+    assert [s for s, c in CLIENTS.items() if c.user_wide] == ["windsurf"]
+
+
+def test_paths_resolve_at_call_time(project, home):
     assert config_path(CLIENTS["cursor"], project) == project / ".cursor" / "mcp.json"
+    assert config_path(CLIENTS["antigravity"], project) == project / ".agents" / "mcp_config.json"
+    assert config_path(CLIENTS["codex"], project) == project / ".codex" / "config.toml"
     assert config_path(CLIENTS["windsurf"], project) == home / ".codeium" / "windsurf" / "mcp_config.json"
-    assert config_path(CLIENTS["codex"], project) == home / ".codex" / "config.toml"
-    monkeypatch.setenv("CODEX_HOME", str(home / "elsewhere"))
-    assert config_path(CLIENTS["codex"], project) == home / "elsewhere" / "config.toml"
+
+
+def test_opencode_uses_the_file_that_exists(project):
+    assert config_path(CLIENTS["opencode"], project) == project / "opencode.jsonc"
+    (project / "opencode.json").write_text("{}", encoding="utf-8")
+    assert config_path(CLIENTS["opencode"], project) == project / "opencode.json"
 
 
 def test_parse_clients(home):
@@ -91,11 +106,23 @@ def test_installed_is_also_seen_from_the_tools_own_folder(home):
     assert "antigravity" in parse_clients("all-installed", no_programs)
 
 
-def test_user_wide_entries_are_named_per_project():
-    assert server_name(CLIENTS["cursor"], "my.proj-ab12") == "ccbridge"
-    # A '.' would make a dotted TOML key, i.e. a nested table.
-    assert server_name(CLIENTS["codex"], "my.proj-ab12") == "ccbridge-my-proj-ab12"
-    assert server_name(CLIENTS["windsurf"], "x y-1") == "ccbridge-x-y-1"
+def test_all_installed_prefers_devin_over_old_windsurf(home, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (home / ".codeium" / "windsurf").mkdir(parents=True)
+    (home / ".codeium" / "windsurf" / "mcp_config.json").write_text("{}", encoding="utf-8")
+    assert "windsurf" in parse_clients("all-installed", no_programs)
+    (home / ".config" / "devin").mkdir(parents=True)
+    found = parse_clients("all-installed", no_programs)
+    assert "devin" in found and "windsurf" not in found
+
+
+def test_server_names_are_portable():
+    assert server_name(CLIENTS["cursor"], "my.proj-ab12cd34ef56") == "ccbridge"
+    for key in ("my.proj-ab12cd34ef56", "A Very Long Project Name Indeed-0123456789ab", "x-ffffffffffff"):
+        name = server_name(CLIENTS["windsurf"], key)
+        assert re.fullmatch(r"ccbridge_[a-z0-9]+(?:_[a-z0-9]+)*", name), name
+        assert len(name) <= 29 and "__" not in name
+    assert server_name(CLIENTS["windsurf"], "my.proj-ab12cd34ef56") == "ccbridge_my_proj_ab12cd"
 
 
 # --- JSON configs ----------------------------------------------------------------
@@ -110,11 +137,8 @@ def test_json_config_is_created(client, project):
 
 @pytest.mark.parametrize("client", JSON_CLIENTS)
 def test_json_config_keeps_other_servers_and_settings(client, project):
-    spec = CLIENTS[client]
-    path = config_path(spec, project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    key = {"mcpServers": "mcpServers", "vscode": "servers", "opencode": "mcp"}[spec.style]
-    path.write_text(json.dumps({"theme": "dark", key: {"other": {"command": "x"}}}), encoding="utf-8")
+    key = STYLES[CLIENTS[client].style][0]
+    path = make(client, project, json.dumps({"theme": "dark", key: {"other": {"command": "x"}}}))
     put(client, project)
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["theme"] == "dark" and data[key]["other"] == {"command": "x"}
@@ -123,17 +147,13 @@ def test_json_config_keeps_other_servers_and_settings(client, project):
 
 @pytest.mark.parametrize("client", JSON_CLIENTS)
 def test_empty_json_config_is_filled_in(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"")  # Antigravity ships its mcp_config.json like this
+    make(client, project, b"")  # Antigravity ships its mcp_config.json like this
     assert entries(client, put(client, project)) == {"ccbridge": (CMD, ARGS, ENV)}
 
 
 @pytest.mark.parametrize("client", JSON_CLIENTS)
 def test_json_config_keeps_crlf_and_drops_a_bom(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\xef\xbb\xbf{\r\n}\r\n")
+    path = make(client, project, b"\xef\xbb\xbf{\r\n}\r\n")
     put(client, project)
     raw = path.read_bytes()
     assert not raw.startswith(b"\xef\xbb\xbf")
@@ -142,13 +162,39 @@ def test_json_config_keeps_crlf_and_drops_a_bom(client, project):
 
 @pytest.mark.parametrize("client", JSON_CLIENTS)
 def test_json_with_comments_is_left_alone(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
     original = b'{\n  // my servers\n  "x": 1\n}\n'
-    path.write_bytes(original)
+    path = make(client, project, original)
     with pytest.raises(ClientError, match="not plain JSON"):
         put(client, project)
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("client", list(CLIENTS))
+def test_ccbridges_tools_are_never_pre_approved(client, project, home):
+    if CLIENTS[client].only_if_exists:
+        make(client, project, "{}")
+    text = put(client, project).read_text(encoding="utf-8").lower()
+    for word in ("autoapprove", "alwaysallow", "trust", "approval", "disabled"):
+        assert word not in text, word
+
+
+def test_entry_shapes():
+    assert put_shape("cursor") == {"type": "stdio", "command": CMD, "args": ARGS, "env": ENV}
+    assert put_shape("vscode") == {"type": "stdio", "command": CMD, "args": ARGS, "env": ENV}
+    assert put_shape("opencode") == {"type": "local", "command": [CMD, *ARGS], "environment": ENV,
+                                     "enabled": True}
+    assert put_shape("kiro") == {"command": CMD, "args": ARGS, "env": ENV}
+
+
+def put_shape(client):
+    from ccbridge.clients import server_entry
+
+    return server_entry(CLIENTS[client].style, CMD, ARGS, ENV)
+
+
+def test_amp_keeps_its_dotted_key(project):
+    path = put("amp", project)
+    assert set(json.loads(path.read_text(encoding="utf-8"))) == {"amp.mcpServers"}
 
 
 def test_rerunning_replaces_our_entry_and_keeps_the_users_env(project):
@@ -162,18 +208,22 @@ def test_rerunning_replaces_our_entry_and_keeps_the_users_env(project):
     assert env == {"CCBRIDGE_CONFIRM_SENDS": "1", "CCBRIDGE_CONFIG": "new.json"}
 
 
+def test_old_windsurf_file_is_only_added_to_never_created(project, home):
+    with pytest.raises(ClientError, match="does not exist"):
+        put("windsurf", project, name="ccbridge_p")
+    assert not (home / ".codeium").exists()
+
+
 def test_user_wide_json_is_backed_up_first(project, home):
-    path = config_path(CLIENTS["windsurf"], project)
-    path.parent.mkdir(parents=True)
-    path.write_text('{"mcpServers": {"mine": {"command": "y"}}}', encoding="utf-8")
-    _, copy = register(CLIENTS["windsurf"], project, "ccbridge-p", CMD, ARGS, ENV, no_programs)
+    path = make("windsurf", project, '{"mcpServers": {"mine": {"command": "y"}}}')
+    _, copy = register(CLIENTS["windsurf"], project, "ccbridge_p", CMD, ARGS, ENV)
     assert copy.read_text(encoding="utf-8") == '{"mcpServers": {"mine": {"command": "y"}}}'
-    assert set(json.loads(path.read_text(encoding="utf-8"))["mcpServers"]) == {"mine", "ccbridge-p"}
+    assert set(json.loads(path.read_text(encoding="utf-8"))["mcpServers"]) == {"mine", "ccbridge_p"}
 
 
 def test_project_configs_are_not_backed_up(project):
     put("cursor", project)
-    _, copy = register(CLIENTS["cursor"], project, "ccbridge", CMD, ARGS, ENV, no_programs)
+    _, copy = register(CLIENTS["cursor"], project, "ccbridge", CMD, ARGS, ENV)
     assert copy is None
     assert not list(project.rglob("*.ccbridge-backup"))
 
@@ -194,94 +244,67 @@ NODE_OPTIONS = "--max-old-space-size=4096"
 
 @pytest.mark.parametrize("client", TOML_CLIENTS)
 def test_toml_block_is_appended_and_the_rest_is_untouched(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(CODEX_CONFIG, encoding="utf-8", newline="")
-    put(client, project, name="ccbridge-p")
+    path = make(client, project, CODEX_CONFIG)
+    put(client, project)
     text = path.read_text(encoding="utf-8")
     assert text.startswith(CODEX_CONFIG)
-    assert "# >>> ccbridge ccbridge-p >>>" in text and "# <<< ccbridge ccbridge-p <<<" in text
+    assert "# >>> ccbridge ccbridge >>>" in text and "# <<< ccbridge ccbridge <<<" in text
     if tomllib:
         data = tomllib.loads(text)
         assert data["model"] == "gpt-5"
-        assert data["mcp_servers"]["ccbridge-p"] == {"command": CMD, "args": ARGS, "env": ENV}
-        assert set(data["mcp_servers"]) == {"playwright", "node_repl", "ccbridge-p"}
+        ours = data["mcp_servers"]["ccbridge"]
+        assert (ours["command"], ours["args"], ours["env"]) == (CMD, ARGS, ENV)
+        assert set(data["mcp_servers"]) == {"playwright", "node_repl", "ccbridge"}
+
+
+def test_codex_gets_a_longer_tool_timeout(project):
+    text = put("codex", project).read_text(encoding="utf-8")
+    assert "tool_timeout_sec = 120" in text
+    assert "tool_timeout_sec" not in put("grok", project).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("client", TOML_CLIENTS)
 def test_toml_rerun_replaces_only_our_own_block(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(CODEX_CONFIG, encoding="utf-8", newline="")
-    put(client, project, name="ccbridge-p")
+    path = make(client, project, CODEX_CONFIG)
+    put(client, project)
     with open(path, "a", encoding="utf-8", newline="") as f:
         f.write('\n[profiles.fast]\nmodel = "gpt-5-mini"\n')  # the user adds more later
-    put(client, project, name="ccbridge-p", env={"CCBRIDGE_CONFIG": "D:/new.json"})
+    put(client, project, env={"CCBRIDGE_CONFIG": "D:/new.json"})
     text = path.read_text(encoding="utf-8")
-    assert text.count("# >>> ccbridge ccbridge-p >>>") == 1
+    assert text.count("# >>> ccbridge ccbridge >>>") == 1
     assert "D:/new.json" in text and ENV["CCBRIDGE_CONFIG"] not in text
     assert text.startswith(CODEX_CONFIG) and text.endswith('[profiles.fast]\nmodel = "gpt-5-mini"\n')
 
 
-def test_two_projects_get_two_codex_blocks(project):
-    put("codex", project, name="ccbridge-a")
-    put("codex", project, name="ccbridge-b", env={"CCBRIDGE_CONFIG": "b.json"})
+def test_two_blocks_live_side_by_side(project):
+    put("codex", project, name="ccbridge_a")
+    put("codex", project, name="ccbridge_b", env={"CCBRIDGE_CONFIG": "b.json"})
     text = config_path(CLIENTS["codex"], project).read_text(encoding="utf-8")
-    assert text.count("# >>> ccbridge ccbridge-a >>>") == 1 and text.count("# >>> ccbridge ccbridge-b >>>") == 1
+    assert text.count("# >>> ccbridge ccbridge_a >>>") == 1 and text.count("# >>> ccbridge ccbridge_b >>>") == 1
     if tomllib:
-        assert set(tomllib.loads(text)["mcp_servers"]) == {"ccbridge-a", "ccbridge-b"}
+        assert set(tomllib.loads(text)["mcp_servers"]) == {"ccbridge_a", "ccbridge_b"}
 
 
 @pytest.mark.parametrize("client", TOML_CLIENTS)
 def test_toml_keeps_crlf(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(CODEX_CONFIG.replace("\n", "\r\n").encode())
-    put(client, project, name="ccbridge-p")
+    path = make(client, project, CODEX_CONFIG.replace("\n", "\r\n"))
+    put(client, project)
     raw = path.read_bytes()
     assert b"\n" not in raw.replace(b"\r\n", b"")
 
 
 @pytest.mark.parametrize("client", TOML_CLIENTS)
 def test_a_table_we_did_not_write_is_never_duplicated(client, project):
-    path = config_path(CLIENTS[client], project)
-    path.parent.mkdir(parents=True, exist_ok=True)
     original = '[mcp_servers.ccbridge]\ncommand = "mine"\n'
-    path.write_text(original, encoding="utf-8")
+    path = make(client, project, original)
     with pytest.raises(ClientError, match="did not write"):
-        put(client, project, name="ccbridge")
+        put(client, project)
     assert path.read_text(encoding="utf-8") == original
-
-
-def test_codex_user_config_is_backed_up_before_it_changes(project):
-    path = config_path(CLIENTS["codex"], project)
-    path.parent.mkdir(parents=True)
-    path.write_text(CODEX_CONFIG, encoding="utf-8", newline="")
-    _, copy = register(CLIENTS["codex"], project, "ccbridge-p", CMD, ARGS, ENV, no_programs)
-    assert copy.read_text(encoding="utf-8") == CODEX_CONFIG
 
 
 def test_toml_strings_survive_quotes_and_backslashes(project):
     odd = "C:\\Users\\O'Brien\\.ccbridge_projects\\p.json"
-    path = put("codex", project, name="ccbridge-p", env={"CCBRIDGE_CONFIG": odd})
+    path = put("codex", project, env={"CCBRIDGE_CONFIG": odd})
     if tomllib:
-        assert tomllib.loads(path.read_text(encoding="utf-8"))["mcp_servers"]["ccbridge-p"]["env"] == {
+        assert tomllib.loads(path.read_text(encoding="utf-8"))["mcp_servers"]["ccbridge"]["env"] == {
             "CCBRIDGE_CONFIG": odd}
-
-
-def test_codex_cli_is_used_when_installed(project, monkeypatch):
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(clients.subprocess, "run", fake_run)
-    which = {"codex": "C:/bin/codex.exe"}.get
-    register(CLIENTS["codex"], project, "ccbridge-p", CMD, ARGS, ENV, which)
-    assert calls == [
-        ["C:/bin/codex.exe", "mcp", "remove", "ccbridge-p"],
-        ["C:/bin/codex.exe", "mcp", "add", "ccbridge-p", "--env",
-         f"CCBRIDGE_CONFIG={ENV['CCBRIDGE_CONFIG']}", "--", CMD, *ARGS],
-    ]
-    assert not config_path(CLIENTS["codex"], project).exists()  # the CLI writes it, not us

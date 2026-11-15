@@ -2,7 +2,10 @@
 Claude Code in - it writes .mcp.json there.
 
     python <ccbridge>/bridge.py host <yourname>           # you: starts everything, prints an invite
-    python <ccbridge>/bridge.py join <invite> <yourname>  # your friend: pastes the invite, done
+    python <ccbridge>/bridge.py join <link> <yourname>    # your friend: pastes the join link, done
+
+host prints a join link (https://<bridge>/j/XXXX-XXXX) and the older, longer
+invite string; join takes either.
 
 Add --allow <name> to either to accept messages from that peer only. On host it
 also locks the room: nobody else can join, even with the invite. Add --new-room
@@ -422,7 +425,7 @@ def write_client(project: Path, client: str, name: str, base: dict) -> tuple[Pat
     entry = server_name(spec, settings_path(project).stem)
     try:
         path, copy = register(spec, project, entry, sys.executable, [str(LAUNCHER)],
-                              {"CCBRIDGE_CONFIG": str(settings_file)}, find_program)
+                              {"CCBRIDGE_CONFIG": str(settings_file)})
     except ClientError as exc:
         raise SetupError(str(exc)) from None
     if not spec.user_wide:
@@ -465,7 +468,7 @@ def _claim_names(url: str, room: str, token: str, names: dict[str, str], key: st
     not be reached, if it could not; raises SetupError if it said no."""
     for client, name in names.items():
         try:
-            register_name(url, room, token, name, key)
+            register_name(url, room, token, name, key, client=client)
         except RelayUnreachable as exc:
             return str(exc)
         except RelayRefused as exc:
@@ -572,13 +575,23 @@ def _from_the_relay(resp: httpx.Response) -> bool:
     return isinstance(data, dict) and "detail" in data
 
 
-def register_name(url: str, room: str, token: str, name: str, key: str) -> None:
+def _register_body(room: str, name: str, key: str, client: Optional[str]) -> dict:
+    import inspect
+
+    # Relays that know client kinds show peers which tool each member is.
+    if client and "client" in inspect.signature(join_body).parameters:
+        return join_body(room, name, key, register_only=True, client=client)
+    return join_body(room, name, key, register_only=True)
+
+
+def register_name(url: str, room: str, token: str, name: str, key: str,
+                  client: Optional[str] = None) -> None:
     """Claim ``name`` in ``room`` for this machine's identity key, without going online.
 
     Raises RelayRefused if the relay says no, RelayUnreachable if no relay answers.
     """
     url = url.rstrip("/")
-    body = join_body(room, name, key, register_only=True)
+    body = _register_body(room, name, key, client)
     headers = {"Authorization": f"Bearer {token}"}
     try:
         with http_client(timeout=15.0) as http:
@@ -651,8 +664,17 @@ def _prepare_database() -> None:
             _make_private(path)
 
 
+def _relay_accepts(option: str) -> bool:
+    """Whether this checkout's relay takes ``option`` (newer relays take more)."""
+    import inspect
+
+    from ccbridge.relay import create_app
+
+    return option in inspect.signature(create_app).parameters
+
+
 def build_relay(room: str, token: str, names: Optional[list[str]],
-                max_members: Optional[int] = None):
+                max_members: Optional[int] = None, invite_code: Optional[str] = None):
     """The relay app for one room. Its settings are passed in, never put in the
     environment, which cloudflared and git would inherit - token included."""
     import inspect
@@ -665,6 +687,8 @@ def build_relay(room: str, token: str, names: Optional[list[str]],
             raise SetupError("this version of the relay has no member limit yet;"
                              " run host without --max-members")
         extra["max_members"] = max_members
+    if invite_code:
+        extra["invite_codes"] = {invite_code: (room, token)}
     _prepare_database()
     try:
         return create_app(str(DB_FILE), open_rooms=False, rooms={room: token},
@@ -842,6 +866,73 @@ def host_room(project: Path, new_room: bool) -> tuple[str, str, bool]:
     return f"bridge-{secrets.token_hex(4)}", secrets.token_urlsafe(32), False
 
 
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+INVITE_CODE_RE = re.compile(r"^[0-9A-Za-z]{4}-?[0-9A-Za-z]{4}\Z")
+# A join link: <relay>/j/<code>, with or without a trailing slash.
+JOIN_LINK_RE = re.compile(r"^(https?://[^\s/?#]+(?:/[^\s?#]*?)?)/j/([0-9A-Za-z]{4}-?[0-9A-Za-z]{4})/?\Z")
+
+
+def new_invite_code() -> str:
+    """A fresh join-link code, "XXXX-XXXX" (40 random bits, Crockford base32)."""
+    try:
+        from ccbridge.relay import make_invite_code
+    except ImportError:
+        n = secrets.randbits(40)
+        text = "".join(_CROCKFORD[(n >> (5 * i)) & 31] for i in reversed(range(8)))
+        return f"{text[:4]}-{text[4:]}"
+    return make_invite_code()
+
+
+def _hosted_code(project: Path, room: str) -> str:
+    """This project's join-link code for ``room``: the one it had, or a new one."""
+    hosted = load_settings(project).get("hosted")
+    if isinstance(hosted, dict) and hosted.get("room") == room:
+        code = hosted.get("code")
+        if isinstance(code, str) and INVITE_CODE_RE.match(code):
+            return code
+    return new_invite_code()
+
+
+def parse_join_link(text: str) -> Optional[tuple[str, str]]:
+    """``(relay URL, code)`` if ``text`` is a join link, else None."""
+    match = JOIN_LINK_RE.match(text.strip())
+    return (match.group(1), match.group(2)) if match else None
+
+
+def redeem_join_link(base: str, code: str) -> tuple[str, str]:
+    """The (room, token) a join link stands for, asked of the relay that made it.
+
+    Raises SetupError if the relay says no, RelayUnreachable if no relay answers.
+    """
+    try:
+        with http_client(timeout=15.0) as http:
+            resp = http.post(f"{base}/v1/invite", json={"code": code})
+    except httpx.HTTPError as exc:
+        raise RelayUnreachable(type(exc).__name__) from None
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+            room, token = data["room"], data["token"]
+        except (ValueError, KeyError, TypeError):
+            raise RelayUnreachable("the answer was not from a ccbridge relay") from None
+        if not (isinstance(room, str) and ROOM_RE.match(room) and isinstance(token, str) and token):
+            raise RelayUnreachable("the answer was not from a ccbridge relay")
+        return room, token
+    try:
+        has_detail = isinstance(resp.json(), dict) and "detail" in resp.json()
+    except ValueError:
+        has_detail = False
+    if resp.status_code == 404 and has_detail:
+        # The relay itself: no such code (or a relay too old for join links).
+        raise SetupError("this join link is not valid - it may be from an earlier run. Ask the"
+                         " host for the link from their current run")
+    if _from_the_relay(resp):
+        if resp.status_code == 429:
+            raise SetupError("too many tries with join links right now - wait a minute and try again")
+        raise SetupError(f"the bridge refused this join link ({resp.status_code}): {_relay_detail(resp)}")
+    raise RelayUnreachable(f"HTTP {resp.status_code}")
+
+
 def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
              clients: Optional[list[str]] = None, local: bool = False,
              max_members: Optional[int] = None) -> None:
@@ -851,11 +942,14 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
     project = Path.cwd()
     _load_mcp_config(project / ".mcp.json")  # a broken .mcp.json stops us before anything runs
     room, token, adopted_legacy = host_room(project, new_room)
+    # The join link's code stays the same across runs, like the room; a new room gets a new one.
+    code = _hosted_code(project, room) if _relay_accepts("invite_codes") else None
     key = identity_key()
     members = list(dict.fromkeys(list(names.values()) + (allow.split(",") if allow else [])))
     # This relay serves exactly one room: anyone who stumbles on the tunnel URL
     # cannot create rooms of their own on it. With --allow, only those names.
-    app = build_relay(room, token, members if allow else None, max_members=max_members)
+    app = build_relay(room, token, members if allow else None, max_members=max_members,
+                      invite_code=code)
 
     sock = _bind(PORT)  # if a bridge is already running, this stops us - leaving its invite alone
     port = sock.getsockname()[1]
@@ -865,14 +959,14 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
     _remove(INVITE_FILE)
     print("Starting bridge...\n")
     server = thread = proc = None
-    invite_line = None
+    invite_text = None
     try:
         with _stop_on_signals():
             server, thread = start_relay(sock, app)
             # Claim your own names (one per tool) before anyone else can reach the relay.
-            for own in names.values():
+            for client, own in names.items():
                 try:
-                    register_name(local_url, room, token, own, key)
+                    register_name(local_url, room, token, own, key, client=client)
                 except RelayRefused as exc:
                     hint = (" Pick another name, or start a fresh room with --new-room."
                             if exc.status == 409 else "")
@@ -884,7 +978,8 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
             # back would be slower, and would break outright on networks whose DNS does
             # not resolve trycloudflare.com subdomains - which some ISPs do not.
             path = write_mcp_config(local_url, room, token, name, peer=allow, key=key,
-                                    hosted={"room": room, "token": token},
+                                    hosted={"room": room, "token": token,
+                                            **({"code": code} if code else {})},
                                     write_file=DEFAULT_CLIENT in clients)
             paths = {DEFAULT_CLIENT: path}
             base = load_settings(project)
@@ -925,8 +1020,12 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
             # background shell (by a person or by an AI agent), where reading a file is
             # far more reliable than scraping a still-running process's output. It
             # lives next to this script, where .gitignore covers it, and is removed
-            # when the bridge stops.
-            _write_private(INVITE_FILE, invite_line + "\n")
+            # when the bridge stops. With a join link, that is the first line; the
+            # full invite (which works too) is the last.
+            link = f"{url}/j/{code}" if code else None
+            lines = [f"python bridge.py join {link} <theirname>"] if link else []
+            invite_text = "\n".join(lines + [invite_line]) + "\n"
+            _write_private(INVITE_FILE, invite_text)
 
             if clients == [DEFAULT_CLIENT]:
                 print(f"Wrote {path} (you are '{name}')")
@@ -940,9 +1039,19 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
             _warn_if_inside_ccbridge()
             _print_notes(notes)
             print("=" * 62)
-            print("SEND THIS ONE LINE TO YOUR FRIEND (privately - it holds the room token):")
-            print()
-            print(f"  {invite_line}")
+            if link:
+                print("SEND THIS LINK TO YOUR FRIEND (privately - it lets them into the room):")
+                print()
+                print(f"  Join link: {link}")
+                print()
+                print("They run:  python bridge.py join <the link> <theirname>")
+                print("(or open the link: it shows the steps, which they can also hand to")
+                print(" their AI agent). The full invite works too:")
+                print(f"  {invite_line}")
+            else:
+                print("SEND THIS ONE LINE TO YOUR FRIEND (privately - it holds the room token):")
+                print()
+                print(f"  {invite_line}")
             print()
             print("=" * 62)
             print(f"\nAlso saved to: {INVITE_FILE}")
@@ -958,7 +1067,7 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
             _stop(proc)
         # The invite dies with the tunnel. Leave the file alone if another run
         # has written its own since.
-        if invite_line is not None and _read_or_none(INVITE_FILE) == invite_line + "\n":
+        if invite_text is not None and _read_or_none(INVITE_FILE) == invite_text:
             _remove(INVITE_FILE)
 
 
@@ -986,9 +1095,23 @@ def cmd_join(invite: str, name: str, allow: Optional[str],
     check_name(name)
     clients = clients or [DEFAULT_CLIENT]
     names = _client_names(name, clients)
-    url, room, token = decode_invite(invite)
     project = Path.cwd()
+    link = parse_join_link(invite)
+    if link is None:
+        url, room, token = decode_invite(invite)
     _load_mcp_config(project / ".mcp.json")  # refuse a broken file before contacting anyone
+    if link is not None:
+        url = link[0]
+        try:
+            room, token = redeem_join_link(*link)
+        except RelayUnreachable as exc:
+            # Unlike with a full invite, there is nothing to save: the room and
+            # token come from the bridge.
+            print(f"No bridge answered at {url} ({exc}).")
+            print("  Usually the host's bridge has stopped, or this link is from an earlier run -")
+            print("  a quick tunnel gets a new address every run. Ask the host for the link from")
+            print("  their current run. Nothing was saved.")
+            return EXIT_UNREACHABLE
     key = identity_key()
     # Claim the names now: a taken name or a stale invite shows up here, not
     # later inside Claude Code.
@@ -1093,7 +1216,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     host.add_argument("--new-room", action="store_true",
                       help="start a fresh room and token; earlier invites stop working")
     join = sub.add_parser("join", help="connect to someone else's relay")
-    join.add_argument("invite", help="the invite string from the host")
+    join.add_argument("invite", help="the join link (https://.../j/XXXX-XXXX) or invite string"
+                                     " from the host")
     join.add_argument("name", help="how you appear to your peer")
     host.add_argument("--allow", metavar="NAME",
                       help="only these peers (comma-separated) may join, and only their"

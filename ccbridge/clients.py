@@ -2,13 +2,17 @@
 
 One entry per tool in CLIENTS. A wrong path or key is a one-line fix there.
 
-Paths use two placeholders: ``{project}`` (the project folder, for tools that
-read a config from the project) and ``~`` (your home folder, for tools that only
-have a user-wide config). ``{codex_home}`` is $CODEX_HOME, or ~/.codex.
+Paths use two placeholders: ``{project}`` (the project folder) and ``~`` (your
+home folder). Nearly every tool reads a config from the project, and ccbridge
+writes that one: a user-wide entry would start in every project's window, so
+two windows would run two servers under one name. A ``|`` separates
+candidates: the first that exists is used, else the first is created.
 
 Every config written here holds no secret: only the command that starts
 ccbridge's MCP server and CCBRIDGE_CONFIG, the path of a settings file that only
-you can read.
+you can read. Nothing here ever pre-approves ccbridge's tools (autoApprove,
+alwaysAllow, trust...): its send and share tools must stay behind the tool's
+own approval prompt.
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ import os
 import re
 import secrets
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,12 +41,13 @@ class ClientError(Exception):
 class Client:
     slug: str
     display: str
-    path: str  # "{project}/..." for a project config, "~/..." or "{codex_home}/..." for a user one
-    style: str  # "mcpServers", "vscode", "opencode" or "toml" - see server_entry()
+    path: str  # "{project}/..." or "~/..."; "a|b" = the first that exists, else a
+    style: str  # how the entry looks - see STYLES
     programs: tuple[str, ...] = ()  # found on PATH = installed
     markers: tuple[str, ...] = ()  # home-relative folders whose presence = installed
-    cli: Optional[str] = None  # a program whose own "mcp add" is used when it is on PATH
-    source: str = ""  # how this entry was checked; "docs" = per the tool's docs, not tested here
+    only_if_exists: bool = False  # never create this file, only add to it
+    source: str = "docs"  # "tested" = seen working here; "docs" = per the tool's docs
+    note: str = ""
 
     @property
     def user_wide(self) -> bool:
@@ -53,25 +57,33 @@ class Client:
 CLIENTS: dict[str, Client] = {c.slug: c for c in [
     Client("claude-code", "Claude Code", "{project}/.mcp.json", "mcpServers",
            programs=("claude",), source="tested"),
-    Client("codex", "OpenAI Codex", "{codex_home}/config.toml", "toml",
-           programs=("codex",), markers=(".codex",), cli="codex", source="docs"),
-    Client("cursor", "Cursor", "{project}/.cursor/mcp.json", "mcpServers",
-           programs=("cursor",), markers=(".cursor",), source="docs"),
-    Client("antigravity", "Google Antigravity", "~/.gemini/antigravity/mcp_config.json",
-           "mcpServers", programs=("antigravity",), markers=(".gemini/antigravity",),
-           source="docs"),
+    Client("codex", "OpenAI Codex", "{project}/.codex/config.toml", "toml-codex",
+           programs=("codex",), markers=(".codex",),
+           note="read only in projects Codex trusts"),
+    Client("cursor", "Cursor", "{project}/.cursor/mcp.json", "stdio",
+           programs=("cursor",), markers=(".cursor",)),
+    Client("antigravity", "Google Antigravity", "{project}/.agents/mcp_config.json", "mcpServers",
+           programs=("agy", "antigravity"), markers=(".gemini/antigravity", ".gemini/config")),
     Client("grok", "Grok Build", "{project}/.grok/config.toml", "toml",
            programs=("grok",), markers=(".grok",), source="tested"),
     Client("gemini", "Gemini CLI", "{project}/.gemini/settings.json", "mcpServers",
-           programs=("gemini",), source="docs"),
+           programs=("gemini",)),
     Client("vscode", "VS Code (GitHub Copilot)", "{project}/.vscode/mcp.json", "vscode",
-           programs=("code",), source="docs"),
-    Client("windsurf", "Windsurf", "~/.codeium/windsurf/mcp_config.json", "mcpServers",
-           programs=("windsurf",), markers=(".codeium/windsurf",), source="docs"),
-    Client("opencode", "opencode", "{project}/opencode.json", "opencode",
+           programs=("code",)),
+    Client("devin", "Devin Desktop (was Windsurf)", "{project}/.devin/mcp_config.json",
+           "mcpServers", programs=("devin",), markers=(".config/devin",)),
+    Client("windsurf", "Windsurf (older versions)", "~/.codeium/windsurf/mcp_config.json",
+           "mcpServers", programs=("windsurf",), only_if_exists=True,
+           note="user-wide; only if that file exists - prefer devin"),
+    # opencode 1.17 still wants mcp.<name> (with "enabled"), not the newer mcp.servers.<name>.
+    Client("opencode", "opencode", "{project}/opencode.jsonc|{project}/opencode.json", "opencode",
            programs=("opencode",), source="tested"),
     Client("kiro", "Kiro", "{project}/.kiro/settings/mcp.json", "mcpServers",
-           programs=("kiro",), markers=(".kiro",), source="docs"),
+           programs=("kiro",), markers=(".kiro",)),
+    Client("amp", "Amp", "{project}/.amp/settings.json", "amp", programs=("amp",)),
+    Client("junie", "Junie", "{project}/.junie/mcp/mcp.json", "mcpServers",
+           programs=("junie",)),
+    Client("zed", "Zed", "{project}/.zed/settings.json", "zed", programs=("zed",)),
 ]}
 
 ALL_INSTALLED = "all-installed"
@@ -82,25 +94,35 @@ MANAGED_ENV = {"CCBRIDGE_CONFIG", "CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRID
                "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY", "CCBRIDGE_ALLOWED_PEERS",
                "CCBRIDGE_CLIENT", "CCBRIDGE_PROJECT_DIR", "PYTHONPATH"}
 
+# style: (key holding the servers, key of the env inside an entry)
+STYLES = {"mcpServers": ("mcpServers", "env"), "stdio": ("mcpServers", "env"),
+          "vscode": ("servers", "env"), "opencode": ("mcp", "environment"),
+          "amp": ("amp.mcpServers", "env"), "zed": ("context_servers", "env")}
+# Codex waits 60 s for a tool by default; get_messages may wait up to 25 s itself.
+TOML_EXTRA = {"toml": {}, "toml-codex": {"tool_timeout_sec": 120}}
+
 
 # --- which tools, and where ------------------------------------------------------
 
 
+def _resolve(template: str, project: Path) -> Path:
+    if template.startswith("{project}/"):
+        return project / template[len("{project}/"):]
+    if template.startswith("~/"):
+        return Path.home() / template[2:]
+    raise ValueError(f"bad path template: {template}")
+
+
 def config_path(client: Client, project: Path) -> Path:
     """The file ``client`` reads its MCP servers from, for ``project``. Resolved
-    when called, so a changed HOME or CODEX_HOME (tests, say) is picked up."""
-    raw = client.path
-    if raw.startswith("{project}"):
-        return project / raw[len("{project}/"):]
-    if raw.startswith("{codex_home}"):
-        base = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        return base / raw[len("{codex_home}/"):]
-    if raw.startswith("~/"):
-        return Path.home() / raw[2:]
-    raise ValueError(f"bad path template for {client.slug}: {raw}")
+    when called, so a changed HOME (tests, say) is picked up."""
+    candidates = [_resolve(t, project) for t in client.path.split("|")]
+    return next((p for p in candidates if p.exists()), candidates[0])
 
 
 def is_installed(client: Client, which: Callable[[str], Optional[str]]) -> bool:
+    if client.only_if_exists:  # its config file is the sign it is (still) used
+        return config_path(client, Path.cwd()).exists()
     if any(which(p) for p in client.programs):
         return True
     return any((Path.home() / m).is_dir() for m in client.markers)
@@ -116,7 +138,10 @@ def parse_clients(raw: Optional[str], which: Callable[[str], Optional[str]]) -> 
         if not part:
             continue
         if part == ALL_INSTALLED:
-            slugs += [s for s, c in CLIENTS.items() if is_installed(c, which)]
+            found = [s for s, c in CLIENTS.items() if is_installed(c, which)]
+            if "devin" in found and "windsurf" in found:
+                found.remove("windsurf")  # Devin Desktop is Windsurf's successor
+            slugs += found
         elif part in CLIENTS:
             slugs.append(part)
         else:
@@ -132,26 +157,27 @@ def parse_clients(raw: Optional[str], which: Callable[[str], Optional[str]]) -> 
 def server_name(client: Client, project_key: str) -> str:
     """The name of ccbridge's entry in ``client``'s config.
 
-    A user-wide config is shared by every project, so its entry names the
-    project: one entry per project, each with its own settings and identity.
+    Project configs use "ccbridge". A user-wide config is shared by every
+    project, so its entry names the project: ``ccbridge_<slug>``. Only
+    [a-z0-9_] with single underscores, and short: some tools drop names with
+    '-', '.' or '__', or cut long tool names.
     """
     if not client.user_wide:
         return "ccbridge"
-    return "ccbridge-" + re.sub(r"[^A-Za-z0-9_-]+", "-", project_key).strip("-")
+    words = re.sub(r"[^a-z0-9]+", "_", project_key.lower()).strip("_")
+    stem, _, digest = words.rpartition("_")
+    short = f"{stem[:13].strip('_')}_{digest[:6]}" if stem else digest[:20]
+    return "ccbridge_" + re.sub(r"_+", "_", short).strip("_")
 
 
 def server_entry(style: str, command: str, args: list[str], env: dict) -> dict:
-    if style == "mcpServers":
+    if style in ("mcpServers", "amp", "zed"):
         return {"command": command, "args": args, "env": env}
-    if style == "vscode":
+    if style in ("stdio", "vscode"):
         return {"type": "stdio", "command": command, "args": args, "env": env}
     if style == "opencode":
         return {"type": "local", "command": [command, *args], "environment": env, "enabled": True}
     raise ValueError(f"no JSON entry for style {style}")
-
-
-_JSON_KEYS = {"mcpServers": ("mcpServers", "env"), "vscode": ("servers", "env"),
-              "opencode": ("mcp", "environment")}
 
 
 # --- writing files -----------------------------------------------------------------
@@ -201,7 +227,7 @@ def _save(path: Path, text: str) -> None:
 def write_json(path: Path, style: str, name: str, command: str, args: list[str],
                env: dict) -> None:
     """Add or replace server ``name`` in a JSON config; everything else is kept."""
-    key, env_key = _JSON_KEYS[style]
+    key, env_key = STYLES[style]
     text, eol = _read(path)
     try:
         config = json.loads(text) if text.strip() else {}
@@ -230,11 +256,20 @@ def _toml_key(key: str) -> str:
     return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key, ensure_ascii=False)
 
 
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return _toml_str(str(value))
+
+
 def _block_markers(name: str) -> tuple[str, str]:
     return f"# >>> ccbridge {name} >>>", f"# <<< ccbridge {name} <<<"
 
 
-def toml_block(name: str, command: str, args: list[str], env: dict, eol: str = "\n") -> str:
+def toml_block(name: str, command: str, args: list[str], env: dict, eol: str = "\n",
+               extra: Optional[dict] = None) -> str:
     start, end = _block_markers(name)
     env_items = ", ".join(f"{_toml_key(k)} = {_toml_str(v)}" for k, v in env.items())
     lines = [
@@ -243,6 +278,7 @@ def toml_block(name: str, command: str, args: list[str], env: dict, eol: str = "
         f"command = {_toml_str(command)}",
         f"args = [{', '.join(_toml_str(a) for a in args)}]",
         f"env = {{ {env_items} }}",
+        *(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in (extra or {}).items()),
         end,
     ]
     return eol.join(lines) + eol
@@ -257,7 +293,8 @@ def _without_block(text: str, name: str) -> tuple[str, Optional[tuple[int, int]]
     return text[:m.start()] + text[m.end():], (m.start(), m.end())
 
 
-def write_toml(path: Path, name: str, command: str, args: list[str], env: dict) -> None:
+def write_toml(path: Path, name: str, command: str, args: list[str], env: dict,
+               extra: Optional[dict] = None) -> None:
     """Add or replace ccbridge's own marked block in a TOML config.
 
     The file is never parsed and rewritten - only our block changes - so the
@@ -270,7 +307,7 @@ def write_toml(path: Path, name: str, command: str, args: list[str], env: dict) 
     if header.search(rest):
         raise ClientError(f"{path} already has an [mcp_servers.{name}] table that ccbridge did not"
                           " write; remove it, then run this again")
-    block = toml_block(name, command, args, env, eol)
+    block = toml_block(name, command, args, env, eol, extra)
     if span:
         new = text[:span[0]] + block + text[span[1]:]
     else:
@@ -290,26 +327,18 @@ def write_toml(path: Path, name: str, command: str, args: list[str], env: dict) 
 
 
 def register(client: Client, project: Path, name: str, command: str, args: list[str],
-             env: dict, which: Callable[[str], Optional[str]]) -> tuple[Path, Optional[Path]]:
+             env: dict) -> tuple[Path, Optional[Path]]:
     """Add ccbridge to ``client``'s config; returns (config path, backup or None).
 
     A user-wide file is backed up first: it holds the user's other settings.
     """
     path = config_path(client, project)
-    cli = which(client.cli) if client.cli else None
-    if cli:
-        # The tool's own command knows its file format best.
-        env_args = [a for k, v in env.items() for a in ("--env", f"{k}={v}")]
-        copy = backup(path)
-        subprocess.run([cli, "mcp", "remove", name], capture_output=True, timeout=60)
-        done = subprocess.run([cli, "mcp", "add", name, *env_args, "--", command, *args],
-                              capture_output=True, text=True, timeout=60)
-        if done.returncode != 0:
-            raise ClientError(f"`{client.cli} mcp add` failed: {(done.stderr or done.stdout).strip()[:300]}")
-        return path, copy
+    if client.only_if_exists and not path.exists():
+        raise ClientError(f"{client.display}: {path} does not exist, so this version does not"
+                          " use it - pick another client (see `bridge.py clients`)")
     copy = backup(path) if client.user_wide else None
-    if client.style == "toml":
-        write_toml(path, name, command, args, env)
+    if client.style in TOML_EXTRA:
+        write_toml(path, name, command, args, env, TOML_EXTRA[client.style])
     else:
         write_json(path, client.style, name, command, args, env)
     return path, copy
