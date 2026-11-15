@@ -11,3 +11,7 @@ invite.txt
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# SQLite write-ahead log files: they hold recent message text
+*.db-wal
+*.db-shm

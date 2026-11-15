@@ -98,7 +98,7 @@ What an agent needs to know, precisely:
 | | |
 |---|---|
 | Install | `pip install -r <ccbridge>/requirements.txt` |
-| Verify | `python -m pytest` inside `<ccbridge>` → 99 tests should pass |
+| Verify | `python -m pytest` inside `<ccbridge>` → 202 tests should pass |
 | Where | Run `bridge.py` **from the project folder**; it writes `.mcp.json` into the current working directory and adds it to that folder's `.gitignore` |
 | Host | `python <ccbridge>/bridge.py host <name>` — **long-running**, do not wait for it to exit; read the invite from **`<ccbridge>/invite.txt`** |
 | Join | `python <ccbridge>/bridge.py join <invite> <name>` — exits immediately after writing `.mcp.json` |
@@ -147,9 +147,16 @@ Nobody types commands. You talk to your own Claude in plain English:
 - *"Any messages from her?"* → `get_messages`
 
 Their agent does the same on their side. Messages arrive labelled with who sent
-them. Each session joins as soon as Claude Code starts and stays marked online
-while it's open. Messages sent while you're away, or while Claude Code restarts,
-are waiting when you next check.
+them and whether they were sent to you alone or to the room. Each session joins
+as soon as Claude Code starts and stays marked online while it's open. Messages
+sent while you're away, or while Claude Code restarts, are waiting when you next
+check.
+
+Delivery is at-least-once: a message counts as delivered only after it has
+reached your agent. If Claude Code crashes or you press Esc in the middle of a
+read, those messages come back on the next read rather than being lost. A burst
+of messages arrives a few at a time (about 40,000 characters per read), so it
+never floods your agent's context.
 
 ---
 
@@ -175,16 +182,31 @@ definition. The design keeps it powerless:
   so the reader treats that sender with extra suspicion.
 - **Sanitizing runs twice** — on the relay (so a hostile client can't skip it) and
   again on delivery (so a hostile *relay* can't skip it either). Sender names,
-  flags, timestamps and relay error text are checked on delivery too.
+  flags, timestamps and relay error text are checked on delivery too. Only the
+  forged framing itself is rewritten; the rest of a message, code included,
+  arrives exactly as it was written.
+- **Credentials don't go out.** `send_message` refuses text that contains the
+  bridge's own token or identity key, or anything shaped like a credential
+  (private keys, cloud and GitHub tokens, passwords in URLs or assignments). The
+  safety note also tells your agent never to read files or secrets in order to
+  send them to a peer. Set `CCBRIDGE_CONFIRM_SENDS=1` to have Claude Code ask
+  you before every outgoing message.
 - **Rooms are isolated by token.** A session in one room can't read or post to
   another, even holding a valid token for that other room. A relay started by
-  `bridge.py host` serves only its own room.
+  `bridge.py host` serves only its own room — not rooms an earlier run left in
+  its database.
+- **Newcomers don't get the history.** Someone who joins later sees at most the
+  last hour (20 messages) of room chat, never what was said before that.
 - **Display names belong to one person.** Your name is tied to your identity key
   on first use, so nobody else in the room can later take it, read your direct
-  messages, or post as you.
-- **Caps:** 8 KB per message, 60 messages/minute per person, limits on joins and
-  new rooms, and old messages expire, so neither a peer nor a stranger who finds
-  the tunnel URL can flood your agent or fill the host's disk.
+  messages, or post as you. Names that differ only in case can't coexist. The
+  key itself never leaves your machine: each relay gets a proof derived from it
+  for that room name, which is useless in any other room. (`bridge.py` picks
+  random room names, so two relays never share one.)
+- **Caps:** 8 KB per message, 60 messages/minute per person and 120 per room,
+  limits on joins and new rooms, and old messages expire, so neither a peer nor
+  a stranger who finds the tunnel URL can flood your agent or fill the host's
+  disk. Direct messages are deleted when their recipient's name expires.
 - **Optional allowlist:** `--allow` / `CCBRIDGE_ALLOWED_PEERS` drops messages from anyone else.
 
 ### What it does not do
@@ -195,6 +217,8 @@ definition. The design keeps it powerless:
 - **It does not judge what a peer asks for.** It guarantees the request arrives
   labelled and powerless, not that the request is reasonable.
 - **Use HTTPS** for anything off your own machine. The token travels in a header.
+- **The tunnel provider can read traffic.** A cloudflared quick tunnel ends TLS
+  at Cloudflare, so Cloudflare can see the room token and message text.
 
 ---
 
@@ -211,6 +235,7 @@ want to run the pieces separately.
 | `CCBRIDGE_NAME` | How you appear to your peer — **different** for each person |
 | `CCBRIDGE_IDENTITY_KEY` | Your own secret that owns your name — **never** shared (`bridge.py` keeps it in `<ccbridge>/.ccbridge_identity`) |
 | `CCBRIDGE_ALLOWED_PEERS` | Optional comma-separated allowlist of peer names |
+| `CCBRIDGE_CONFIRM_SENDS` | Optional; `1` makes Claude Code ask you before every `send_message` |
 
 Running the relay directly, without `bridge.py`:
 
@@ -236,11 +261,27 @@ them instead with `CCBRIDGE_ROOMS="room:token,room2:token2"`, and set
 python -m pytest
 ```
 
-99 tests: relay auth and room isolation, name ownership and resume-after-restart,
-rate limits, size caps and retention, injection and banner-forgery defences
-(including known bypasses), a hostile relay, the peer allowlist, cursor behaviour,
-invite encoding and setup errors, and an end-to-end round trip over real HTTP
-between two sessions.
+202 tests: relay auth and room isolation, name ownership and resume-after-restart,
+at-least-once delivery and cancelled reads, rate limits, size caps and retention,
+injection and banner-forgery defences (including known bypasses, and linear-time
+checks against a CPU-exhaustion attack), outbound credential checks, a hostile
+relay, the peer allowlist, cursor behaviour, database upgrades, invite encoding
+and setup errors, and an end-to-end round trip over real HTTP between two
+sessions.
+
+---
+
+## Upgrading from 0.2
+
+Both people need 0.3: a 0.3 relay turns away a 0.2 client with a message asking
+it to update. To update, both people run `git pull` in their ccbridge folder; the
+host restarts `bridge.py host`; then both restart Claude Code.
+
+Nothing is lost: messages, direct messages and where each of you stopped reading
+all carry over. Your name carries over too. 0.3 proves ownership differently, so
+on its first connection your updated client shows the relay that it holds your
+old key (by the hash 0.2 stored, never the key itself), and from then on uses
+the new proof.
 
 ---
 

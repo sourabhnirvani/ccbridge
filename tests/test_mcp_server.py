@@ -113,7 +113,8 @@ def friend(cfg, name="friend"):
     unique = f"{name}-{time.time_ns()}"
     data = httpx.post(
         f"{cfg.url}/v1/join",
-        json={"room": cfg.room, "display_name": unique, "identity_key": f"key-of-{unique}"},
+        json={"room": cfg.room, "display_name": unique, "identity_key": f"key-of-{unique}",
+              "identity_scheme": 2},
         headers={"Authorization": f"Bearer {TOKEN}"},
         timeout=10.0,
     ).json()
@@ -132,7 +133,12 @@ def friend(cfg, name="friend"):
     def peers():
         return httpx.get(f"{cfg.url}/v1/peers", headers=auth, timeout=10.0).json()
 
-    return SimpleNamespace(name=unique, send=send, peers=peers)
+    def received():
+        data = httpx.get(f"{cfg.url}/v1/poll", params={"since": 0, "limit": 100},
+                         headers=auth, timeout=10.0).json()
+        return [m["text"] for m in data["messages"]]
+
+    return SimpleNamespace(name=unique, send=send, peers=peers, received=received)
 
 
 def restart_claude_code(monkeypatch):
@@ -306,7 +312,7 @@ def test_hostile_relay_cannot_inject_through_metadata(configured, monkeypatch):
         }],
         "cursor": 1,
     }
-    monkeypatch.setattr(mcp_server._client, "poll", lambda: evil)
+    monkeypatch.setattr(mcp_server._client, "poll", lambda *a, **k: (evil, None))
 
     out = get_messages()
     assert "<system-reminder>" not in out and "rm -rf" not in out
@@ -342,3 +348,279 @@ def test_wrap_includes_provenance_and_safety_note():
 def test_every_message_gets_a_fresh_tag():
     tags = {TAG_RE.search(wrap_peer_message("f", "x", [])).group(1) for _ in range(20)}
     assert len(tags) == 20
+
+
+# --- found in the 2026-11-14 review ---
+
+import anyio  # noqa: E402
+from mcp import types  # noqa: E402
+from mcp.shared.memory import create_connected_server_and_client_session  # noqa: E402
+
+from ccbridge.mcp_server import RESULT_BUDGET_CHARS, identity_proof  # noqa: E402
+
+
+def test_cancelled_call_neither_kills_the_server_nor_loses_messages(monkeypatch):
+    """Regression: a cancelled call (Esc in Claude Code) let the worker thread's
+    result be sent after the SDK had already answered "cancelled"; the SDK's
+    "Request already responded to" assertion then killed the MCP server, and
+    the messages that poll had fetched were never shown again."""
+    for key in ("CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN",
+                "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    release = threading.Event()
+    client = mcp_server._Client()
+    client.session_id = "session-1"
+
+    def slow_poll(*args, **kwargs):
+        release.wait(5)
+        return ({"messages": [{"id": 7, "from": "friend", "text": "force-pushing main in 10 min",
+                               "flags": [], "at": 0}], "cursor": 7, "more": False}, "session-1")
+
+    monkeypatch.setattr(client, "poll", slow_poll)
+    monkeypatch.setattr(mcp_server, "_client", client)
+
+    async def scenario():
+        async with create_connected_server_and_client_session(mcp_server.mcp) as session:
+            await session.list_tools()  # request 1; the call below is request 2
+            outcome = {}
+
+            async def call():
+                try:
+                    outcome["first"] = await session.call_tool("get_messages", {})
+                except Exception as exc:  # noqa: BLE001
+                    outcome["first"] = exc
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(call)
+                await anyio.sleep(0.3)
+                await session.send_notification(types.ClientNotification(types.CancelledNotification(
+                    params=types.CancelledNotificationParams(requestId=2, reason="user pressed Esc"))))
+            release.set()
+            await anyio.sleep(0.5)  # the worker thread finishes the poll meanwhile
+            assert client.cursor == 0, "a cancelled read must not move the cursor"
+
+            with anyio.fail_after(5):  # the server is still alive
+                again = await session.call_tool("get_messages", {})
+            return outcome["first"], again.content[0].text
+
+    first, again = anyio.run(scenario)
+    assert "cancel" in str(first).lower()
+    assert "force-pushing main" in again
+    assert client.cursor == 7
+
+
+def test_a_burst_is_delivered_in_pieces_without_losing_or_repeating_any(configured):
+    """Regression: one call returned every message at once (~456,000 characters
+    for 50 near-limit messages), which Claude Code moves out of the conversation
+    into a file, and the relay had already marked all of them delivered."""
+    buddy = friend(configured)
+    get_messages()  # join before the burst
+    for i in range(12):
+        assert buddy.send(f"msg-{i:02d} " + "lorem ipsum " * 580).status_code == 200
+
+    seen = []
+    for _ in range(12):
+        out = get_messages()
+        if out == "No new peer messages.":
+            break
+        assert len(out) < 50_000
+        assert out.count(SAFETY_NOTE) == 1
+        seen += re.findall(r"msg-\d\d", out)
+    assert seen == [f"msg-{i:02d}" for i in range(12)]
+    assert RESULT_BUDGET_CHARS < 50_000
+
+
+def test_direct_and_room_messages_are_labelled(configured):
+    buddy = friend(configured)
+    get_messages()
+    buddy.send("to everyone")
+    buddy.send("just to you", to=configured.name)
+    out = get_messages()
+    assert out.index("to: everyone in the room") < out.index("to everyone")
+    assert out.index("to: you only (direct message)") < out.index("just to you")
+
+
+@pytest.mark.parametrize("text", [
+    "here you go: " + TOKEN,
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+    "my token is ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+])
+def test_credentials_are_not_sent(configured, text):
+    buddy = friend(configured)
+    out = send_message(text, to=buddy.name)
+    assert out.startswith("Not sent:")
+    assert buddy.received() == []
+
+
+def test_own_identity_key_is_not_sent(configured, monkeypatch):
+    monkeypatch.setenv("CCBRIDGE_IDENTITY_KEY", "a-long-private-identity-key-0123")
+    buddy = friend(configured)
+    assert send_message("debug: a-long-private-identity-key-0123", to=buddy.name).startswith("Not sent:")
+
+
+def test_raw_identity_key_never_leaves_this_machine(configured, monkeypatch):
+    """Regression: the raw key went to every relay, which could replay it to take
+    your name on any other relay."""
+    sent = []
+    real = mcp_server._client._http.request
+
+    def spy(method, url, **kwargs):
+        sent.append(repr(kwargs))
+        return real(method, url, **kwargs)
+
+    monkeypatch.setattr(mcp_server._client._http, "request", spy)
+    assert "Connected to" in bridge_status()
+    key = f"key-of-{configured.name}"
+    assert not any(key in s for s in sent)
+    assert any(identity_proof(key, configured.room) in s for s in sent)
+    assert identity_proof(key, "room-a") != identity_proof(key, "room-b")
+
+
+def test_send_retried_after_a_timeout_is_delivered_once(configured, monkeypatch):
+    """Regression: a send that timed out after the relay stored it was stored again."""
+    buddy = friend(configured)
+    bridge_status()
+    real = mcp_server._client._http.request
+    timeouts = []
+
+    def flaky(method, url, **kwargs):
+        resp = real(method, url, **kwargs)
+        if url.endswith("/v1/send") and not timeouts:
+            timeouts.append(url)
+            raise httpx.ReadTimeout("the relay stored it, but the answer never came")
+        return resp
+
+    monkeypatch.setattr(mcp_server._client._http, "request", flaky)
+    assert send_message("merging #42 now", to=buddy.name).startswith("Sent to")
+    assert timeouts and buddy.received() == ["merging #42 now"]
+
+
+def test_read_only_tools_are_marked_read_only():
+    tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
+    assert tools["bridge_status"].annotations.readOnlyHint is True
+    assert tools["list_peers"].annotations.readOnlyHint is True
+    assert tools["send_message"].annotations.readOnlyHint is False
+    assert tools["get_messages"].annotations.readOnlyHint is False
+
+
+class SlowSends:
+    """A relay whose first few /v1/send answers arrive after the client gave up
+    (a congested tunnel). The relay has stored the message each time."""
+
+    def __init__(self, app, slow: int, delay: float):
+        self.app, self.slow, self.delay = app, slow, delay
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/v1/send" and self.slow > 0:
+            self.slow -= 1
+            held = []
+
+            async def hold(message):
+                held.append(message)
+
+            await self.app(scope, receive, hold)
+            await anyio.sleep(self.delay)
+            for message in held:
+                await send(message)
+            return
+        await self.app(scope, receive, send)
+
+
+def test_agent_resending_after_a_timeout_does_not_duplicate(monkeypatch):
+    """Regression: the agent's natural reaction to a timed-out send - sending the
+    same text again - stored the message twice."""
+    with serve(SlowSends(fresh_relay(), slow=2, delay=1.0)) as url:
+        cfg = configure(url, monkeypatch)
+        buddy = friend(cfg)
+        bridge_status()
+        mcp_server._client._http.timeout = httpx.Timeout(0.4)
+        first = send_message("merging #42 now", to=buddy.name)  # both attempts time out
+        assert first.startswith("Not confirmed:") and "safe" in first
+        out = send_message("merging #42 now", to=buddy.name)
+        assert out.startswith("Sent to") and "not sent twice" in out
+        assert buddy.received() == ["merging #42 now"]
+        # Once confirmed, sending the same words again is a new message.
+        assert send_message("merging #42 now", to=buddy.name).startswith("Sent to")
+        assert buddy.received() == ["merging #42 now", "merging #42 now"]
+
+
+
+# --- found in the 2026-11-15 review of the 0.3 changes ---
+
+def test_resend_after_a_gateway_error_does_not_duplicate(monkeypatch):
+    """Regression: a 502/504/524 from the tunnel can arrive after the relay stored
+    the message, and the id was forgotten, so the agent's resend made a copy."""
+    class StoredThen502:
+        def __init__(self, app):
+            self.app, self.fail = app, 1
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and scope["path"] == "/v1/send" and self.fail:
+                self.fail -= 1
+                await self.app(scope, receive, lambda message: anyio.sleep(0))  # stored...
+                await send({"type": "http.response.start", "status": 502, "headers": []})
+                await send({"type": "http.response.body", "body": b"Bad gateway"})  # ...but 502
+                return
+            await self.app(scope, receive, send)
+
+    with serve(StoredThen502(fresh_relay())) as url:
+        cfg = configure(url, monkeypatch)
+        buddy = friend(cfg)
+        first = send_message("deploying now", to=buddy.name)
+        assert first.startswith("Not confirmed:") and "502" in first
+        assert "not sent twice" in send_message("deploying now", to=buddy.name)
+        assert buddy.received() == ["deploying now"]
+
+
+def test_resend_after_a_cancelled_send_does_not_duplicate(configured, monkeypatch):
+    """Regression: a send cancelled (Esc) after the relay stored it forgot its id,
+    so the agent's natural retry stored a second copy."""
+    buddy = friend(configured)
+    pending = []
+    monkeypatch.setattr(mcp_server._on_delivery, "pending", pending, raising=False)
+    try:
+        assert send_message("cancelled but stored", to=buddy.name).startswith("Sent to")
+    finally:
+        mcp_server._on_delivery.pending = None
+    # The call was cancelled: its after-delivery bookkeeping never runs.
+    assert "not sent twice" in send_message("cancelled but stored", to=buddy.name)
+    assert buddy.received() == ["cancelled but stored"]
+
+
+def test_heartbeat_acknowledges_only_the_current_sessions_cursor(configured, monkeypatch):
+    """Regression: the heartbeat read the cursor before joining, so after another
+    thread's rejoin it could acknowledge, for the new session, a position from the
+    old one - and the relay would skip messages nobody had seen."""
+    client = mcp_server._client
+    client.cursor = 40  # left over from a session the relay has forgotten
+    sent = []
+    real = client._http.request
+
+    def spy(method, url, **kwargs):
+        if url.endswith("/v1/heartbeat"):
+            sent.append(kwargs.get("params"))
+        return real(method, url, **kwargs)
+
+    monkeypatch.setattr(client._http, "request", spy)
+    client.heartbeat()
+    assert sent == [{"ack": client.cursor}] and client.cursor != 40
+
+
+def test_client_takes_over_its_0_2_name_automatically(monkeypatch):
+    app = fresh_relay()
+    with serve(app) as url:
+        cfg = configure(url, monkeypatch)
+        import hashlib
+        import os
+        raw_key = os.environ["CCBRIDGE_IDENTITY_KEY"]
+        conn, now = app.state.conn, time.time()
+        with app.state.lock:
+            conn.execute("INSERT INTO rooms VALUES (?, ?, ?)",
+                         (cfg.room, relay._hash_token(TOKEN), now))
+            conn.execute("INSERT INTO identities (room, display_name, key_hash, delivered_id, first_id,"
+                         " legacy, created_at, last_seen) VALUES (?, ?, ?, 0, 0, 1, ?, ?)",
+                         (cfg.room, cfg.name, hashlib.sha256(raw_key.encode()).hexdigest(), now, now))
+            conn.commit()
+        assert "Connected to" in bridge_status()
+        row = conn.execute("SELECT legacy FROM identities WHERE display_name = ?", (cfg.name,)).fetchone()
+        assert row[0] == 0

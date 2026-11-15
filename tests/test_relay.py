@@ -27,7 +27,8 @@ def key_for(name):
 def join(client, room, name, token, key=None):
     return client.post(
         "/v1/join",
-        json={"room": room, "display_name": name, "identity_key": key or key_for(name)},
+        json={"room": room, "display_name": name, "identity_key": key or key_for(name),
+              "identity_scheme": 2},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -100,17 +101,57 @@ def test_same_identity_can_rejoin_while_still_online(client):
     assert join(client, "duo", "sourabh", "t").status_code == 200
 
 
+def heartbeat(client, who, ack=None, room="duo", token="t"):
+    params = {} if ack is None else {"ack": ack}
+    return client.post("/v1/heartbeat", params=params,
+                       headers=headers(who["session_id"], room, token))
+
+
 def test_rejoin_resumes_where_the_last_session_stopped(client):
     a = join(client, "duo", "sourabh", "t").json()
     b = join(client, "duo", "friend", "t").json()
     send(client, a, "one")
     first = poll(client, b)
     assert [m["text"] for m in first["messages"]] == ["one"]
+    heartbeat(client, b, ack=first["cursor"])  # the client says "one" reached its agent
 
     # friend's Claude Code restarts; meanwhile sourabh keeps talking.
     send(client, a, "two, sent while you were restarting")
     b2 = join(client, "duo", "friend", "t").json()
     assert [m["text"] for m in poll(client, b2)["messages"]] == ["two, sent while you were restarting"]
+
+
+def test_unacknowledged_messages_are_delivered_again_after_a_restart(client):
+    """Regression: a poll used to mark what it returned as delivered before the
+    client had shown it to anyone, so a crash or a cancelled call lost it."""
+    a = join(client, "duo", "sourabh", "t").json()
+    b = join(client, "duo", "friend", "t").json()
+    send(client, a, "one")
+    assert [m["text"] for m in poll(client, b)["messages"]] == ["one"]
+
+    b2 = join(client, "duo", "friend", "t").json()  # crashed before acknowledging
+    assert [m["text"] for m in poll(client, b2)["messages"]] == ["one"]
+
+
+def test_next_poll_acknowledges_the_previous_one(client):
+    a = join(client, "duo", "sourabh", "t").json()
+    b = join(client, "duo", "friend", "t").json()
+    send(client, a, "one")
+    first = poll(client, b)
+    poll(client, b, since=first["cursor"])  # asking for what comes next is the ack
+
+    b2 = join(client, "duo", "friend", "t").json()
+    assert b2["cursor"] == first["cursor"]
+    assert poll(client, b2)["messages"] == []
+
+
+def test_ack_cannot_run_ahead_of_real_messages(client):
+    a = join(client, "duo", "sourabh", "t").json()
+    b = join(client, "duo", "friend", "t").json()
+    assert heartbeat(client, b, ack=10**12).status_code == 200
+    send(client, a, "sent after the bogus ack")
+    b2 = join(client, "duo", "friend", "t").json()
+    assert [m["text"] for m in poll(client, b2)["messages"]] == ["sent after the bogus ack"]
 
 
 def test_first_join_receives_recent_messages_but_not_old_history(client):
@@ -299,3 +340,208 @@ def test_unknown_session_rejected(client):
     join(client, "duo", "sourabh", "t")
     resp = client.get("/v1/peers", headers=headers("made-up-session", "duo", "t"))
     assert resp.status_code == 401
+
+
+# --- found in the 2026-11-14 review ---
+
+import sqlite3  # noqa: E402
+
+from ccbridge.relay import IDENTITY_TTL_SECONDS, ROOM_RATE_LIMIT_MESSAGES  # noqa: E402
+
+
+def test_newcomer_cannot_read_history_by_polling_from_zero(client):
+    """Regression: the first-join backlog was only a client default; since=0
+    handed a newcomer every broadcast the room had kept (up to 7 days)."""
+    a = join(client, "duo", "sourabh", "t").json()
+    send(client, a, "the staging DB password is in the vault")
+    with client.app.state.lock:
+        client.app.state.conn.execute(
+            "UPDATE messages SET created_at = created_at - ?", (FIRST_JOIN_BACKLOG_SECONDS + 60,)
+        )
+        client.app.state.conn.commit()
+
+    late = join(client, "duo", "latecomer", "t").json()
+    assert poll(client, late, since=0)["messages"] == []
+    send(client, a, "welcome")
+    assert [m["text"] for m in poll(client, late, since=0)["messages"]] == ["welcome"]
+
+
+def test_closed_relay_does_not_serve_rooms_left_from_an_earlier_run(tmp_path, monkeypatch):
+    """Regression: 'closed' only stopped new rooms being created; a room from an
+    earlier run stayed usable, so rotating the token revoked nothing."""
+    db = str(tmp_path / "relay.db")
+    monkeypatch.setenv("CCBRIDGE_ROOMS", "bridge-old:old-token")
+    first = TestClient(create_app(db, open_rooms=False))
+    assert join(first, "bridge-old", "friend", "old-token").status_code == 200
+    first.app.state.conn.close()
+
+    monkeypatch.setenv("CCBRIDGE_ROOMS", "bridge-new:new-token")
+    second = TestClient(create_app(db, open_rooms=False))
+    try:
+        assert join(second, "bridge-old", "friend", "old-token").status_code == 403
+        assert join(second, "bridge-new", "sourabh", "new-token").status_code == 200
+    finally:
+        second.app.state.conn.close()
+
+
+def test_rate_limit_also_applies_to_the_room_as_a_whole(client):
+    """Regression: the limit was per name, and one token holder can make many names."""
+    people = [join(client, "duo", f"sock-{i}", "t").json() for i in range(3)]
+    accepted = 0
+    for who in people:
+        for _ in range(RATE_LIMIT_MESSAGES):
+            accepted += send(client, who, "spam").status_code == 200
+    assert accepted == ROOM_RATE_LIMIT_MESSAGES
+
+
+def test_rate_limited_sends_are_not_sanitized(client, monkeypatch):
+    """Regression: the relay sanitized before checking the rate limit, so a flood
+    of refused sends still cost it CPU."""
+    a = join(client, "duo", "sourabh", "t").json()
+    for _ in range(RATE_LIMIT_MESSAGES):
+        send(client, a, "ok")
+    calls = []
+    monkeypatch.setattr(relay, "sanitize", lambda text: calls.append(text) or (text, []))
+    assert send(client, a, "one too many").status_code == 429
+    assert calls == []
+
+
+def test_out_of_range_cursor_is_a_validation_error(client):
+    a = join(client, "duo", "sourabh", "t").json()
+    resp = client.get("/v1/poll", params={"since": 2**63},
+                      headers=headers(a["session_id"], "duo", "t"))
+    assert resp.status_code == 422
+
+
+def test_a_retried_send_is_stored_once(client):
+    a = join(client, "duo", "sourabh", "t").json()
+    b = join(client, "duo", "friend", "t").json()
+    payload = {"text": "merging #42 now", "id": "client-chosen-id-1"}
+    auth = headers(a["session_id"], "duo", "t")
+    first = client.post("/v1/send", json=payload, headers=auth).json()
+    again = client.post("/v1/send", json=payload, headers=auth).json()
+    assert again["id"] == first["id"] and again.get("duplicate") is True
+    assert [m["text"] for m in poll(client, b)["messages"]] == ["merging #42 now"]
+
+
+def test_direct_messages_go_when_their_recipient_name_expires(client):
+    """Regression: a DM outlived its recipient's claim on the name, so whoever
+    claimed the name next could read it."""
+    alice = join(client, "duo", "alice", "t").json()
+    join(client, "duo", "bob", "t")
+    send(client, alice, "new VPN password is in the vault", to="bob")
+    with client.app.state.lock:
+        client.app.state.conn.execute(
+            "UPDATE identities SET last_seen = last_seen - ? WHERE display_name = 'bob'",
+            (IDENTITY_TTL_SECONDS + 60,),
+        )
+        client.app.state.conn.commit()
+    client.app.state.prune(time.time())
+
+    impostor = join(client, "duo", "bob", "t", key=key_for("mallory")).json()
+    assert poll(client, impostor, since=0)["messages"] == []
+
+
+def test_names_differing_only_in_case_cannot_coexist(client):
+    assert join(client, "duo", "alice", "t").status_code == 200
+    clash = join(client, "duo", "Alice", "t", key=key_for("mallory"))
+    assert clash.status_code == 409 and "too close" in clash.json()["detail"]
+    assert join(client, "duo", "alice ", "t").status_code == 400
+
+
+def test_join_reports_the_relay_version(client):
+    from ccbridge import __version__
+    assert join(client, "duo", "sourabh", "t").json()["version"] == __version__
+
+
+_SCHEMA_0_2 = """
+CREATE TABLE rooms (room TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE identities (room TEXT NOT NULL, display_name TEXT NOT NULL, key_hash TEXT NOT NULL,
+    delivered_id INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
+    PRIMARY KEY (room, display_name));
+CREATE TABLE sessions (session_id TEXT PRIMARY KEY, room TEXT NOT NULL, display_name TEXT NOT NULL,
+    joined_at REAL NOT NULL, last_seen REAL NOT NULL);
+CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL,
+    sender_session TEXT NOT NULL, sender_name TEXT NOT NULL, recipient_name TEXT,
+    body TEXT NOT NULL, flags TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL);
+"""
+
+
+def _old_database(path, now, unread=30):
+    """A ccbridge 0.2 database: sourabh and friend joined; friend has read only
+    the first message; then sourabh sent more, room-wide and direct."""
+    old = sqlite3.connect(path)
+    old.executescript(_SCHEMA_0_2)
+    old.execute("INSERT INTO rooms VALUES ('duo', ?, ?)", (relay._hash_token("t"), now))
+    for name in ("sourabh", "friend"):
+        old.execute("INSERT INTO identities VALUES ('duo', ?, ?, 1, ?, ?)",
+                    (name, relay._hash_token(key_for(name)), now, now))
+    old.execute("INSERT INTO sessions VALUES ('old-session', 'duo', 'friend', ?, ?)", (now, now))
+    for i in range(1 + unread):
+        to = "friend" if i % 3 == 2 else None
+        old.execute("INSERT INTO messages (room, sender_session, sender_name, recipient_name, body,"
+                    " created_at) VALUES ('duo', 's', 'sourabh', ?, ?, ?)", (to, f"msg {i}", now - 7200))
+    old.commit()
+    old.close()
+
+
+def join_0_3(client, name, key, legacy=False):
+    from ccbridge.mcp_server import identity_proof
+    payload = {"room": "duo", "display_name": name, "identity_key": identity_proof(key, "duo"),
+               "identity_scheme": 2}
+    if legacy:
+        import hashlib
+        payload["legacy_key_hash"] = hashlib.sha256(key.encode()).hexdigest()
+    return client.post("/v1/join", json=payload, headers={"Authorization": "Bearer t"})
+
+
+def test_upgrade_from_0_2_loses_no_unread_messages(tmp_path):
+    """Regression: the first 0.3 build released every 0.2 name claim, so each
+    person came back as a newcomer and unread messages became unreachable."""
+    db = tmp_path / "old.db"
+    _old_database(db, time.time())
+    upgraded = TestClient(create_app(str(db)))
+    try:
+        assert upgraded.app.state.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        # Without proof of the old key the name stays taken - and the relay says
+        # it is a claim from 0.2 that can be taken over.
+        plain = join_0_3(upgraded, "friend", key_for("friend"))
+        assert plain.status_code == 409 and plain.headers.get(relay.LEGACY_CLAIM_HEADER) == "1"
+
+        friend = join_0_3(upgraded, "friend", key_for("friend"), legacy=True)
+        assert friend.status_code == 200
+        texts = [m["text"] for m in poll(upgraded, friend.json())["messages"]]
+        assert texts == [f"msg {i}" for i in range(1, 31)]  # every unread one, DMs included
+
+        # Taken over: from now on the 0.3 proof alone holds the name.
+        assert join_0_3(upgraded, "friend", key_for("friend")).status_code == 200
+    finally:
+        upgraded.app.state.conn.close()
+
+
+def test_a_carried_over_name_cannot_be_taken_without_the_old_key(tmp_path):
+    db = tmp_path / "old.db"
+    _old_database(db, time.time())
+    upgraded = TestClient(create_app(str(db)))
+    try:
+        assert join_0_3(upgraded, "friend", key_for("mallory"), legacy=True).status_code == 409
+        upgraded.app.state.prune(time.time())
+        dms = upgraded.app.state.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE recipient_name = 'friend'").fetchone()[0]
+        assert dms == 10  # the carried-over claim keeps its direct messages alive
+    finally:
+        upgraded.app.state.conn.close()
+
+
+def test_a_0_3_name_cannot_be_taken_with_a_legacy_proof(client):
+    join(client, "duo", "sourabh", "t")
+    assert join_0_3(client, "sourabh", "anything-at-all-xxxxxxxx", legacy=True).status_code == 409
+
+
+def test_a_0_2_client_is_asked_to_update(client):
+    """A 0.2 client sends its raw key. Letting it claim a name would lock its own
+    updated self out later, since the update sends a derived proof instead."""
+    resp = client.post("/v1/join",
+                       json={"room": "duo", "display_name": "sourabh", "identity_key": key_for("x")},
+                       headers={"Authorization": "Bearer t"})
+    assert resp.status_code == 426 and "Update ccbridge" in resp.json()["detail"]
