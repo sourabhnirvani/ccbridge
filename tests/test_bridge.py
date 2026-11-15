@@ -521,6 +521,9 @@ def gateway():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
+            # Read the request first: on Windows, closing with it unread resets the
+            # connection, and the client sees a ReadError instead of this answer.
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             body = b"<!DOCTYPE html><html><title>Cloudflare Tunnel error</title></html>"
             self.send_response(answer["status"])
             self.send_header("Content-Type", "text/html")
@@ -1042,6 +1045,23 @@ def test_no_link_from_a_relay_without_join_links(in_tmp, host):
         pytest.skip("this relay has join links")
     text = host(while_up=lambda: bridge.INVITE_FILE.read_text(encoding="utf-8"))
     assert len(text.splitlines()) == 1 and "/j/" not in text
+
+
+def test_host_limits_members_to_32_by_default(in_tmp, host, monkeypatch):
+    from ccbridge import relay
+
+    real, seen = relay.create_app, {}
+
+    def create_app(db_path, open_rooms=None, rooms=None, allowed_names=None, max_members=None):
+        seen["max_members"] = max_members
+        return real(db_path, open_rooms=open_rooms, rooms=rooms, allowed_names=allowed_names)
+
+    monkeypatch.setattr(relay, "create_app", create_app)
+    host()
+    assert seen == {"max_members": 32}
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", None, max_members=500)
+    assert seen == {"max_members": 500}
 
 
 def test_clients_command_lists_every_client(in_tmp, tools, capsys):
