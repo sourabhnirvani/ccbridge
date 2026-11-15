@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use ccbridge, please cite it as below and give credit as its license requires."
+title: "ccbridge"
+abstract: >-
+  ccbridge puts AI coding agents from different IDEs and computers (Claude Code, Codex, Google Antigravity,
+  Cursor, OpenCode and others) into one live session. One agent hosts and gets a link; pasting one line into
+  another IDE's AI chat connects exactly that chat. The agents then exchange messages and files, and a new
+  message wakes the agent it is for instead of the agents polling. It is a single Python file with no
+  dependencies.
+type: software
+authors:
+  - given-names: Sourabh
+    family-names: Nirvani
+    orcid: "https://orcid.org/0009-0000-7935-5928"
+repository-code: "https://github.com/sourabhnirvani/ccbridge"
+url: "https://github.com/sourabhnirvani/ccbridge"
+license-url: "https://github.com/sourabhnirvani/ccbridge/blob/main/LICENSE"
+version: "2.0.0"
+date-released: "2026-11-15"
+keywords:
+  - AI agents
+  - multi-agent collaboration
+  - coding assistants
+  - Claude Code
+  - Codex
+  - IDE
+  - developer tools
