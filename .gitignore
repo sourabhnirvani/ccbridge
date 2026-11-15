@@ -1,9 +1,14 @@
-# Hold the room token and your identity key, created by `bridge.py host`/`join`
-.ccbridge_token
+# Hold room tokens and your identity key, created by `bridge.py host`/`join`
+.ccbridge_projects/
 .ccbridge_identity
 invite.txt
+# Where ccbridge 0.2 kept the room token
+.ccbridge_token
+# Left behind only if bridge.py is killed while writing a secret file
+.ccbridge-*.tmp
 
-# Holds the token in plain text - never commit it
+# Its 'ccbridge' entry points at files on this machine (and before 0.3 it
+# held the token itself) - never commit it
 .mcp.json
 
 .env

@@ -32,7 +32,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -163,6 +163,10 @@ class JoinRequest(BaseModel):
     identity_scheme: int = Field(default=1, ge=1, le=100)
     # Only to take over a 0.2 claim: SHA-256 of the raw identity key.
     legacy_key_hash: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # Claim (or check) the name without starting a session: bridge.py does this
+    # at setup, so the name is yours before Claude Code even starts, and you do
+    # not show as online until it has.
+    register_only: bool = False
 
 
 class SendRequest(BaseModel):
@@ -254,10 +258,32 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None) -> FastAPI:
-    """Build the relay. ``open_rooms`` defaults to ``CCBRIDGE_OPEN_ROOMS`` (on)."""
+def _env_rooms() -> dict[str, str]:
+    rooms = {}
+    for entry in filter(None, os.getenv("CCBRIDGE_ROOMS", "").split(",")):
+        room, _, token = entry.partition(":")
+        if room.strip() and token.strip():
+            rooms[room.strip()] = token.strip()
+    return rooms
+
+
+def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None,
+               rooms: Optional[dict[str, str]] = None,
+               allowed_names: Optional[Iterable[str]] = None) -> FastAPI:
+    """Build the relay.
+
+    Each setting left as None comes from the environment: ``open_rooms`` from
+    CCBRIDGE_OPEN_ROOMS (on), ``rooms`` ({room: token}, pre-provisioned) from
+    CCBRIDGE_ROOMS, ``allowed_names`` from CCBRIDGE_ALLOWED_NAMES. bridge.py
+    passes them in, so the room token never sits in the environment that
+    cloudflared and git inherit.
+    """
     if open_rooms is None:
         open_rooms = _env_flag("CCBRIDGE_OPEN_ROOMS", True)
+    if rooms is None:
+        rooms = _env_rooms()
+    if allowed_names is None:
+        allowed_names = os.getenv("CCBRIDGE_ALLOWED_NAMES", "").split(",")
 
     # The relay is reachable from the internet through a tunnel; do not publish an
     # interactive API explorer alongside it.
@@ -295,13 +321,21 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None) 
     room_creates = _Window(ROOM_CREATE_LIMIT, RATE_LIMIT_WINDOW_SECONDS)
     last_prune = [0.0]
 
-    # Rooms pre-provisioned via the environment take precedence over TOFU.
+    # bridge.py host --allow: only these names may join, in every room this relay
+    # serves (bridge.py serves exactly one). A leaked invite then lets nobody in.
+    only_names = frozenset(n.strip() for n in allowed_names if n.strip()) or None
+
+    def _check_allowed_name(name: str) -> None:
+        if only_names is not None and name not in only_names:
+            raise HTTPException(
+                403,
+                "This room only lets in the names its host invited. Ask the host"
+                " which name to use.",
+            )
+
+    # Pre-provisioned rooms take precedence over TOFU.
     provisioned: set[str] = set()
-    for entry in filter(None, os.getenv("CCBRIDGE_ROOMS", "").split(",")):
-        room, _, token = entry.partition(":")
-        room, token = room.strip(), token.strip()
-        if not room or not token:
-            continue
+    for room, token in rooms.items():
         if not ROOM_RE.match(room):
             raise ValueError(f"CCBRIDGE_ROOMS: invalid room name {room!r}")
         provisioned.add(room)
@@ -417,6 +451,8 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None) 
             # room A can never be used to act inside room B.
             if row is None or row["room"] != x_ccbridge_room:
                 raise HTTPException(401, "Unknown session - join again")
+            # A session from before the host locked the room ends here too.
+            _check_allowed_name(row["display_name"])
             conn.execute("UPDATE sessions SET last_seen = ? WHERE session_id = ?",
                          (now, x_ccbridge_session))
             conn.execute("UPDATE identities SET last_seen = ? WHERE room = ? AND display_name = ?",
@@ -428,9 +464,14 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None) 
     def healthz() -> dict:
         return {"ok": True, "version": __version__}
 
-    def _join_locked(req: JoinRequest, token: str, key_hash: str, now: float) -> tuple[int, str]:
+    def _join_locked(req: JoinRequest, token: str, key_hash: str,
+                     now: float) -> tuple[int, Optional[str]]:
         """Body of ``join``. Caller must hold ``lock``."""
         _check_room_token(req.room, token, create=True, now=now)
+        # After the token check, so the list of names is no oracle for anyone
+        # without the token; before the join limit, so names that are not let in
+        # cannot use it up and lock out the ones that are.
+        _check_allowed_name(req.display_name)
         if not joins.allow(req.room, now):
             raise HTTPException(429, "Too many joins - try again in a minute")
 
@@ -485,6 +526,11 @@ def create_app(db_path: str = "ccbridge.db", open_rooms: Optional[bool] = None) 
                 headers={LEGACY_CLAIM_HEADER: "1"} if ident["legacy"] else None,
             )
 
+        if req.register_only:
+            conn.execute("UPDATE identities SET last_seen = ? WHERE room = ? AND display_name = ?",
+                         (now, req.room, req.display_name))
+            conn.commit()
+            return cursor, None
         session_id = secrets.token_urlsafe(24)
         conn.execute(
             "INSERT INTO sessions (session_id, room, display_name, joined_at, last_seen)"

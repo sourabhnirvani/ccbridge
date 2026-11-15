@@ -545,3 +545,89 @@ def test_a_0_2_client_is_asked_to_update(client):
                        json={"room": "duo", "display_name": "sourabh", "identity_key": key_for("x")},
                        headers={"Authorization": "Bearer t"})
     assert resp.status_code == 426 and "Update ccbridge" in resp.json()["detail"]
+
+
+def register(client, room, name, token, key=None):
+    """What bridge.py host/join send: claim the name without starting a session."""
+    return client.post(
+        "/v1/join",
+        json={"room": room, "display_name": name, "identity_key": key or key_for(name),
+              "identity_scheme": 2, "register_only": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+def test_a_name_can_be_claimed_without_going_online(client):
+    resp = register(client, "duo", "sourabh", "t")
+    assert resp.status_code == 200 and resp.json()["session_id"] is None
+
+    friend = join(client, "duo", "friend", "t").json()
+    peers = client.get("/v1/peers", headers=headers(friend["session_id"], "duo", "t")).json()
+    assert peers["peers"] == []  # claimed, but not shown as online
+    # The name is taken all the same...
+    assert join(client, "duo", "sourabh", "t", key="someone-elses-key-123456").status_code == 409
+    # ...and its owner, starting Claude Code later, gets in.
+    assert join(client, "duo", "sourabh", "t").status_code == 200
+
+
+def test_messages_sent_after_a_name_is_claimed_wait_for_it(client):
+    register(client, "duo", "sourabh", "t")
+    friend = join(client, "duo", "friend", "t").json()
+    send(client, friend, "sent before sourabh opened Claude Code")
+    sourabh = join(client, "duo", "sourabh", "t").json()
+    assert [m["text"] for m in poll(client, sourabh)["messages"]] == [
+        "sent before sourabh opened Claude Code"]
+
+
+@pytest.fixture()
+def locked_room(tmp_path, monkeypatch):
+    """A relay like `bridge.py host sourabh --allow alex` runs."""
+    monkeypatch.setenv("CCBRIDGE_ALLOWED_NAMES", "sourabh,alex")
+    return TestClient(create_app(str(tmp_path / "relay.db")))
+
+
+def test_a_locked_room_lets_in_only_the_invited_names(locked_room):
+    assert join(locked_room, "duo", "sourabh", "t").status_code == 200
+    assert join(locked_room, "duo", "alex", "t").status_code == 200
+    resp = join(locked_room, "duo", "mallory", "t")
+    assert resp.status_code == 403 and "names its host invited" in resp.json()["detail"]
+    assert register(locked_room, "duo", "mallory", "t").status_code == 403
+    # Names are matched exactly, like the --allow list on the receiving side.
+    assert join(locked_room, "duo", "Alex", "t").status_code == 403
+
+
+def test_a_locked_room_does_not_reveal_its_names_without_the_token(locked_room):
+    join(locked_room, "duo", "sourabh", "t")
+    resp = join(locked_room, "duo", "mallory", "wrong-token")
+    assert resp.status_code == 403 and resp.json()["detail"] == "Bad room token"
+
+
+def test_locking_a_room_ends_sessions_of_names_not_invited(tmp_path, monkeypatch):
+    db = str(tmp_path / "relay.db")
+    monkeypatch.delenv("CCBRIDGE_ALLOWED_NAMES", raising=False)
+    before = TestClient(create_app(db))
+    mallory = join(before, "duo", "mallory", "t").json()
+    join(before, "duo", "sourabh", "t")
+
+    monkeypatch.setenv("CCBRIDGE_ALLOWED_NAMES", "sourabh,alex")
+    after = TestClient(create_app(db))  # the host restarted with --allow alex
+    resp = after.get("/v1/poll", params={"since": 0},
+                     headers=headers(mallory["session_id"], "duo", "t"))
+    assert resp.status_code == 403
+
+
+def test_names_not_let_in_cannot_use_up_the_join_limit(locked_room):
+    """Regression: joins refused by the lock still counted, so a leaked invite could
+    lock the invited friend out with "Too many joins"."""
+    assert join(locked_room, "duo", "sourabh", "t").status_code == 200  # the host, first
+    for _ in range(relay.JOIN_LIMIT_PER_ROOM + 5):
+        assert join(locked_room, "duo", "mallory", "t").status_code == 403
+    assert join(locked_room, "duo", "alex", "t").status_code == 200
+
+
+def test_settings_can_be_passed_in_rather_than_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("CCBRIDGE_ROOMS", "env-room:env-token")
+    monkeypatch.setenv("CCBRIDGE_ALLOWED_NAMES", "someone-else")
+    app = TestClient(create_app(":memory:", open_rooms=False, rooms={"duo": "t"}, allowed_names=[]))
+    assert join(app, "duo", "sourabh", "t").status_code == 200
+    assert join(app, "env-room", "sourabh", "env-token").status_code == 403

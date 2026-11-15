@@ -9,7 +9,8 @@ travels in an Authorization header, so plain HTTP over the open internet would
 hand it to anyone on the path.
 
 Other settings: CCBRIDGE_PORT, CCBRIDGE_DB (default ./ccbridge.db),
-CCBRIDGE_ROOMS ("room:token,..."), CCBRIDGE_OPEN_ROOMS=0 to refuse unlisted rooms.
+CCBRIDGE_ROOMS ("room:token,..."), CCBRIDGE_OPEN_ROOMS=0 to refuse unlisted rooms,
+CCBRIDGE_ALLOWED_NAMES ("alice,bob") to let only those names join.
 """
 
 import os

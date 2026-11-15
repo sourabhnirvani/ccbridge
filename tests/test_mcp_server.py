@@ -104,6 +104,7 @@ def configure(relay_url, monkeypatch):
     monkeypatch.setenv("CCBRIDGE_NAME", name)
     monkeypatch.setenv("CCBRIDGE_IDENTITY_KEY", f"key-of-{name}")
     monkeypatch.delenv("CCBRIDGE_ALLOWED_PEERS", raising=False)
+    monkeypatch.delenv("CCBRIDGE_CONFIG", raising=False)
     monkeypatch.setattr(mcp_server, "_client", mcp_server._Client())
     return SimpleNamespace(url=relay_url, room=room, name=name)
 
@@ -148,7 +149,7 @@ def restart_claude_code(monkeypatch):
 
 def test_missing_config_is_reported_not_crashed(monkeypatch):
     for key in ("CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN",
-                "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY"):
+                "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY", "CCBRIDGE_CONFIG"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(mcp_server, "_client", mcp_server._Client())
     assert "Not configured" in bridge_status()
@@ -624,3 +625,138 @@ def test_client_takes_over_its_0_2_name_automatically(monkeypatch):
         assert "Connected to" in bridge_status()
         row = conn.execute("SELECT legacy FROM identities WHERE display_name = ?", (cfg.name,)).fetchone()
         assert row[0] == 0
+
+
+SETTING_KEYS = ("CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN", "CCBRIDGE_NAME",
+                "CCBRIDGE_IDENTITY_KEY", "CCBRIDGE_ALLOWED_PEERS")
+
+
+def configure_from_file(configured, tmp_path, monkeypatch, bom=False, **extra):
+    """Move the settings from the environment into a settings file, as bridge.py writes them."""
+    import json
+    import os
+
+    settings = {key: os.environ[key] for key in SETTING_KEYS if os.environ.get(key)}
+    settings.update(extra)
+    for key in SETTING_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    path = tmp_path / "settings.json"
+    path.write_text(("﻿" if bom else "") + json.dumps(settings), encoding="utf-8")
+    monkeypatch.setenv("CCBRIDGE_CONFIG", str(path))
+    return path
+
+
+def test_settings_can_come_from_the_settings_file(configured, tmp_path, monkeypatch):
+    configure_from_file(configured, tmp_path, monkeypatch)
+    out = bridge_status()
+    assert "Connected" in out and f"you are: {configured.name}" in out
+
+
+def test_settings_file_saved_with_a_byte_order_mark_is_read(configured, tmp_path, monkeypatch):
+    configure_from_file(configured, tmp_path, monkeypatch, bom=True)
+    assert "Connected" in bridge_status()
+
+
+def test_environment_wins_over_the_settings_file(configured, tmp_path, monkeypatch):
+    configure_from_file(configured, tmp_path, monkeypatch)
+    monkeypatch.setenv("CCBRIDGE_NAME", "from-the-environment")
+    assert mcp_server._Client._config()[3] == "from-the-environment"
+
+
+def test_missing_settings_file_is_reported_not_crashed(configured, tmp_path, monkeypatch):
+    path = configure_from_file(configured, tmp_path, monkeypatch)
+    path.unlink()
+    out = bridge_status()
+    assert "Not configured" in out and "missing" in out and "bridge.py" in out
+
+
+def test_damaged_settings_file_is_reported_not_crashed(configured, tmp_path, monkeypatch):
+    path = configure_from_file(configured, tmp_path, monkeypatch)
+    path.write_text("{ not json", encoding="utf-8")
+    out = bridge_status()
+    assert "Not configured" in out and "cannot be read" in out
+
+
+def test_credentials_from_the_settings_file_are_not_sent(configured, tmp_path, monkeypatch):
+    key = "only-in-the-settings-file-0123456789"
+    configure_from_file(configured, tmp_path, monkeypatch, CCBRIDGE_IDENTITY_KEY=key)
+    assert "Not sent" in send_message(f"my key is {key}")
+
+
+def test_allowlist_from_the_settings_file_is_applied(configured, tmp_path, monkeypatch):
+    stranger = friend(configured, "stranger")
+    configure_from_file(configured, tmp_path, monkeypatch, CCBRIDGE_ALLOWED_PEERS="someone-else")
+    get_messages()  # join first, so the message below is after our starting point
+    stranger.send("hello")
+    assert "dropped" in get_messages()
+
+
+def test_a_running_server_follows_a_changed_settings_file(configured, tmp_path, monkeypatch):
+    """Regression: after `bridge.py host --new-room`, a running Claude Code mixed the old
+    session and room with the new token, and every call failed until a restart."""
+    import json
+
+    path = configure_from_file(configured, tmp_path, monkeypatch)
+    assert f"room: {configured.room}" in bridge_status()
+
+    new = SimpleNamespace(url=configured.url, room=f"new-{configured.room}", name=configured.name)
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    settings.update(CCBRIDGE_ROOM=new.room, CCBRIDGE_TOKEN=TOKEN)
+    path.write_text(json.dumps(settings), encoding="utf-8")
+
+    assert f"room: {new.room}" in bridge_status()
+    friend(new).send("hello in the new room")
+    assert "hello in the new room" in get_messages()
+
+
+def test_heartbeat_outlives_a_settings_file_it_cannot_read_yet(configured, tmp_path, monkeypatch):
+    """Regression: one failed read of the settings file stopped the heartbeat for good."""
+    import json
+    import os
+
+    settings = {key: os.environ[key] for key in SETTING_KEYS if os.environ.get(key)}
+    for key in SETTING_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    path = tmp_path / "settings.json"
+    monkeypatch.setenv("CCBRIDGE_CONFIG", str(path))  # not written yet
+    watcher = friend(configured)
+
+    stop = start_heartbeat(interval=0.2)
+    try:
+        time.sleep(0.6)  # a few beats fail: no settings file
+        path.write_text(json.dumps(settings), encoding="utf-8")
+        for _ in range(50):
+            if configured.name in str(watcher.peers()):
+                break
+            time.sleep(0.1)
+        assert configured.name in str(watcher.peers())
+    finally:
+        stop.set()
+
+
+def test_a_rewrite_of_the_same_size_and_time_is_noticed(tmp_path, monkeypatch):
+    """Regression: settings were cached by mtime and size, which a rewrite can keep."""
+    import json
+    import os
+
+    from ccbridge import config
+
+    monkeypatch.delenv("CCBRIDGE_ROOM", raising=False)
+    path = tmp_path / "settings.json"
+    monkeypatch.setenv("CCBRIDGE_CONFIG", str(path))
+    path.write_text(json.dumps({"CCBRIDGE_ROOM": "room-aaaa"}), encoding="utf-8")
+    assert config.setting("CCBRIDGE_ROOM") == "room-aaaa"
+    stamp = os.stat(path).st_mtime_ns
+    path.write_text(json.dumps({"CCBRIDGE_ROOM": "room-bbbb"}), encoding="utf-8")
+    os.utime(path, ns=(stamp, stamp))
+    assert config.setting("CCBRIDGE_ROOM") == "room-bbbb"
+
+
+def test_a_local_relay_is_reached_directly_even_with_a_proxy_set(relay_url, monkeypatch):
+    """Regression: httpx sent loopback requests to HTTP_PROXY (or Windows' system proxy)."""
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(var, "http://127.0.0.1:9")
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    configure(relay_url, monkeypatch)  # a fresh client, made with the proxy settings in place
+    assert "Connected" in bridge_status()

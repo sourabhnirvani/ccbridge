@@ -4,10 +4,16 @@ Claude Code in - it writes .mcp.json there.
     python <ccbridge>/bridge.py host <yourname>           # you: starts everything, prints an invite
     python <ccbridge>/bridge.py join <invite> <yourname>  # your friend: pastes the invite, done
 
-Add --allow <name> to either to accept messages from that peer only.
+Add --allow <name> to either to accept messages from that peer only. On host it
+also locks the room: nobody else can join, even with the invite. Add --new-room
+to host to start over with a fresh room and token, for example after an invite
+leaked.
 
 Everything either side needs - relay URL, room, token - is packed into the single
 invite string, so nobody has to copy three separate values into a config file.
+The token and your identity key are kept in a settings file inside the ccbridge
+folder that only you can read; .mcp.json only names that file, so it is safe
+even in a project that commits its .mcp.json.
 """
 
 from __future__ import annotations
@@ -15,32 +21,72 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
+import hashlib
 import json
 import os
 import re
 import secrets
-import shutil
+import signal
+import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
+import httpx
+
+from ccbridge.identity import LEGACY_CLAIM_HEADER, join_body, legacy_key_hash
+from ccbridge.net import http_client
 from ccbridge.safety import NAME_RE, ROOM_RE
 
 HERE = Path(__file__).resolve().parent
 PORT = int(os.getenv("CCBRIDGE_PORT", "8787"))
-TUNNEL_URL_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
+# A quick tunnel's address is a few random words: https://word-word-word.trycloudflare.com.
+# The (?!api\.) is belt and braces: when cloudflared cannot get a tunnel it logs
+# the API it called, https://api.trycloudflare.com, which is no relay.
+TUNNEL_URL_RE = re.compile(rb"https://(?!api\.)[a-z0-9]+(?:-[a-z0-9]+)+\.trycloudflare\.com")
 TUNNEL_WAIT_SECONDS = 30.0
+PUBLIC_CHECK_SECONDS = 20.0
+RELAY_START_SECONDS = 15.0
 
-# All three hold secrets, live next to this script, and are gitignored there.
-TOKEN_FILE = HERE / ".ccbridge_token"
+# All of these hold secrets, live next to this script, and are gitignored there.
 IDENTITY_FILE = HERE / ".ccbridge_identity"
+PROJECTS_DIR = HERE / ".ccbridge_projects"  # one settings file per project folder
 INVITE_FILE = HERE / "invite.txt"
+DB_FILE = HERE / "ccbridge.db"
+# Where ccbridge 0.2 kept the one room this whole folder hosted.
+LEGACY_TOKEN_FILE = HERE / ".ccbridge_token"
+
+# What .mcp.json starts. Run as a script by its absolute path, so Python looks
+# for modules next to it - never in the project folder Claude Code starts it
+# from, where a folder named `mcp` or `ccbridge` would shadow the real packages.
+LAUNCHER = HERE / "run_mcp_server.py"
+
+# Keys of the 'ccbridge' entry's env in .mcp.json that this script manages. Any
+# other key there (CCBRIDGE_CONFIRM_SENDS, say) is the user's and is kept.
+_MANAGED_ENV = {"CCBRIDGE_CONFIG", "CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN",
+                "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY", "CCBRIDGE_ALLOWED_PEERS", "PYTHONPATH"}
 
 
 class SetupError(Exception):
     """A problem the person running this can fix; printed without a traceback."""
+
+
+class RelayRefused(Exception):
+    """The relay answered a join with an error."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"{status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+
+class RelayUnreachable(Exception):
+    """No relay answered at that address: what happened instead is the message."""
 
 
 def encode_invite(url: str, room: str, token: str) -> str:
@@ -70,6 +116,89 @@ def check_name(name: str) -> str:
     return name
 
 
+# --- files -------------------------------------------------------------------
+
+
+def _make_private(path: Path) -> None:
+    """Make ``path`` readable by you only (0600; macOS and Linux - Windows has no such mode)."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write a file only you can read, in one step.
+
+    The text goes into a new 0600 file that then replaces ``path``, so it is never
+    readable by others, and a reader - the MCP server, re-reading its settings -
+    sees the old file or the new one, never half of one.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".ccbridge-{path.name}-{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        for attempt in range(100):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows refuses while another program has the file open - the
+                # MCP server reading its settings, for a moment.
+                if attempt == 99:
+                    raise
+                time.sleep(0.02)
+    except BaseException:
+        _remove(tmp)
+        raise
+
+
+def find_program(name: str) -> Optional[str]:
+    """``name`` from a folder on PATH - never from the current folder.
+
+    On Windows, shutil.which looks in the current folder first, so a git.cmd or
+    cloudflared.exe in the project would run in place of the real one.
+    """
+    if os.name == "nt":
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    else:
+        exts = [""]
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not folder or not os.path.isabs(folder):
+            continue
+        for ext in exts:
+            candidate = os.path.join(folder, name + ext)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def _remove(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _read_or_none(path: Path) -> Optional[str]:
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except (OSError, ValueError):
+        return None
+
+
+def _read_text(path: Path) -> tuple[str, str]:
+    """``path``'s text, minus any byte-order mark, and the line ending it uses."""
+    # utf-8-sig: Notepad and PowerShell 5 save UTF-8 with a BOM, which json rejects.
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        text = f.read()
+    return text, ("\r\n" if "\r\n" in text else "\n")
+
+
 def identity_key() -> str:
     """This machine's identity key, created on first use.
 
@@ -77,59 +206,378 @@ def identity_key() -> str:
     so rejoining with a fresh invite keeps your name. Keep it private.
     """
     if IDENTITY_FILE.exists():
-        key = IDENTITY_FILE.read_text(encoding="utf-8").strip()
+        key = IDENTITY_FILE.read_text(encoding="utf-8-sig").strip()
         if len(key) >= 16:
+            _make_private(IDENTITY_FILE)  # versions before 0.3 left it readable by all
             return key
     key = secrets.token_urlsafe(32)
-    IDENTITY_FILE.write_text(key + "\n", encoding="utf-8")
+    _write_private(IDENTITY_FILE, key + "\n")
     return key
+
+
+def settings_path(project: Path) -> Path:
+    """The settings file for ``project``: one per project folder, inside PROJECTS_DIR."""
+    resolved = project.resolve()
+    digest = hashlib.sha256(
+        os.path.normcase(str(resolved)).encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", resolved.name).strip("-.")[:40] or "project"
+    return PROJECTS_DIR / f"{slug}-{digest}.json"
+
+
+def _moved_settings(project: Path) -> Optional[Path]:
+    """The settings file of the folder this project was moved or renamed from, if any.
+
+    Found through the path in its .mcp.json. Only if that folder is gone: a copy
+    of a project (the original still there) gets a room of its own.
+    """
+    try:
+        config, _ = _load_mcp_config(project / ".mcp.json")
+    except SetupError:
+        return None
+    entry = config["mcpServers"].get("ccbridge")
+    env = entry.get("env") if isinstance(entry, dict) else None
+    named = env.get("CCBRIDGE_CONFIG") if isinstance(env, dict) else None
+    if not isinstance(named, str):
+        return None
+    path = Path(named)
+    try:
+        if path.resolve().parent != PROJECTS_DIR.resolve() or not path.is_file():
+            return None
+        old = json.loads(_read_text(path)[0]).get("project")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(old, str) or Path(old).exists():
+        return None
+    return path
+
+
+def _settings_file(project: Path) -> Path:
+    """Where ``project``'s settings are now: its own file, or the one it was moved from."""
+    path = settings_path(project)
+    if path.exists():
+        return path
+    return _moved_settings(project) or path
+
+
+def load_settings(project: Path) -> dict:
+    path = _settings_file(project)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(_read_text(path)[0])
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        raise SetupError(f"{path} is damaged - delete it and run this again")
+    return data
+
+
+def _load_mcp_config(path: Path) -> tuple[dict, str]:
+    """The project's .mcp.json (empty if there is none) and its line ending."""
+    if not path.exists():
+        return {"mcpServers": {}}, "\n"
+    try:
+        text, eol = _read_text(path)
+        config = json.loads(text) if text.strip() else {}
+    except (OSError, ValueError) as exc:
+        raise SetupError(f"{path} exists but is not valid JSON ({exc}); fix or remove it") from None
+    servers = config.setdefault("mcpServers", {}) if isinstance(config, dict) else None
+    if not isinstance(servers, dict):
+        raise SetupError(f"{path} has an unexpected shape; fix or remove it")
+    return config, eol
 
 
 def _ensure_gitignored(entry: str) -> None:
     ignore = Path.cwd() / ".gitignore"
-    # surrogateescape: never choke on, or mangle, a .gitignore that is not UTF-8.
-    existing = ignore.read_text(encoding="utf-8", errors="surrogateescape") if ignore.exists() else ""
-    lines = {line.strip() for line in existing.splitlines()}
+    existing = ""
+    if ignore.exists():
+        # newline="": keep the file's own line endings (an LF file stays LF on
+        # Windows). surrogateescape: never choke on, or mangle, non-UTF-8 bytes.
+        with open(ignore, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            existing = f.read()
+    lines = {line.strip().lstrip("﻿") for line in existing.splitlines()}
     if entry in lines or f"/{entry}" in lines:
         return
-    updated = existing.rstrip("\n") + "\n" + entry + "\n" if existing.strip() else entry + "\n"
-    ignore.write_text(updated, encoding="utf-8", errors="surrogateescape")
+    eol = "\r\n" if "\r\n" in existing else "\n"
+    if existing and not existing.endswith(("\n", "\r")):
+        existing += eol
+    with open(ignore, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        f.write(existing + entry + eol)
 
 
-def write_mcp_config(url: str, room: str, token: str, name: str, peer: str | None,
-                     key: str | None = None) -> Path:
-    """Write .mcp.json in the current directory so Claude Code picks the bridge up."""
-    path = Path.cwd() / ".mcp.json"
-    config: object = {}
-    if path.exists():
-        try:
-            config = json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise SetupError(f"{path} exists but is not valid JSON ({exc}); fix or remove it") from None
-    servers = config.setdefault("mcpServers", {}) if isinstance(config, dict) else None
-    if not isinstance(servers, dict):
-        raise SetupError(f"{path} has an unexpected shape; fix or remove it")
+def write_mcp_config(url: str, room: str, token: str, name: str, peer: Optional[str],
+                     key: Optional[str] = None, *, hosted: Optional[dict] = None) -> Path:
+    """Point Claude Code in the current folder at the bridge; returns .mcp.json's path.
 
-    env = {
-        "PYTHONPATH": str(HERE),
+    The token and identity key go into this project's settings file, which only
+    you can read; .mcp.json gets nothing but that file's path. ``hosted``
+    records the room this project hosts, so the next ``host`` here reuses it.
+    """
+    project = Path.cwd()
+    path = project / ".mcp.json"
+    config, eol = _load_mcp_config(path)  # refuse a broken file before writing anything
+
+    try:
+        previous = load_settings(project)
+    except SetupError:
+        previous = {}  # damaged: rewritten below
+    settings: dict = {
         "CCBRIDGE_RELAY_URL": url,
         "CCBRIDGE_ROOM": room,
         "CCBRIDGE_TOKEN": token,
         "CCBRIDGE_NAME": name,
         "CCBRIDGE_IDENTITY_KEY": key or identity_key(),
+        "project": str(project.resolve()),
     }
     if peer:
-        env["CCBRIDGE_ALLOWED_PEERS"] = peer
-    servers["ccbridge"] = {
-        "command": sys.executable,
-        "args": ["-m", "ccbridge.mcp_server"],
-        "env": env,
-    }
-    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        settings["CCBRIDGE_ALLOWED_PEERS"] = peer
+    hosted = hosted or previous.get("hosted")
+    if isinstance(hosted, dict):
+        settings["hosted"] = hosted
+    settings_file = settings_path(project)
+    moved_from = _settings_file(project)
+    _write_private(settings_file, json.dumps(settings, indent=2) + "\n")
 
-    # The token lives in this file, so keep it out of git.
+    servers = config["mcpServers"]
+    old = servers.get("ccbridge")
+    old_env = old.get("env") if isinstance(old, dict) else None
+    env = {k: v for k, v in old_env.items() if k not in _MANAGED_ENV} if isinstance(old_env, dict) else {}
+    env["CCBRIDGE_CONFIG"] = str(settings_file)
+    servers["ccbridge"] = {"command": sys.executable, "args": [str(LAUNCHER)], "env": env}
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(json.dumps(config, indent=2).replace("\n", eol) + eol)
+    if moved_from != settings_file:
+        _remove(moved_from)  # the project moved: its settings (and room) moved with it
+
+    # No secret in it any more, but its ccbridge entry only works on this machine.
     _ensure_gitignored(".mcp.json")
     return path
+
+
+def _git(*args: str) -> Optional[subprocess.CompletedProcess]:
+    git = find_program("git")
+    if not git:
+        return None
+    try:
+        return subprocess.run([git, *args], cwd=Path.cwd(), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def mcp_config_warnings() -> list[str]:
+    """What to tell the user about git and this project's .mcp.json."""
+    notes = []
+    tracked = _git("ls-files", "--error-unmatch", "--", ".mcp.json")
+    if tracked is not None and tracked.returncode == 0:
+        notes.append(
+            ".mcp.json is tracked by git in this project. It holds no secret, but its"
+            " 'ccbridge' entry points at files on this machine - leave that change out"
+            " of your commits."
+        )
+    # Versions before 0.3 kept the token in .mcp.json itself.
+    leaked = _git("log", "--all", "--format=%h", "-S", "CCBRIDGE_TOKEN", "--", ".mcp.json")
+    if leaked is not None and leaked.returncode == 0 and leaked.stdout.strip():
+        notes.append(
+            f"git history has an .mcp.json with a ccbridge room token in it (commit"
+            f" {leaked.stdout.split()[0]}). Anyone with a copy of this repository can"
+            " join that room: whoever hosts it should run `bridge.py host --new-room`."
+        )
+    return notes
+
+
+def _warn_if_inside_ccbridge() -> None:
+    if Path.cwd().resolve() == HERE:
+        print("Note: you ran this inside the ccbridge folder, so the bridge only loads when")
+        print("      Claude Code is opened here. To use it in your project, run this from")
+        print("      the project folder instead.\n")
+
+
+def _print_notes(notes: list[str]) -> None:
+    for note in notes:
+        print(f"Note: {note}\n")
+
+
+# --- talking to a relay --------------------------------------------------------
+
+
+def _relay_detail(resp: httpx.Response) -> str:
+    try:
+        detail = resp.json().get("detail")
+    except Exception:  # noqa: BLE001 - not JSON, or not an object
+        detail = None
+    text = detail if isinstance(detail, str) else resp.text
+    # The relay may be someone else's: print nothing that could drive the terminal.
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return re.sub(r"\s+", " ", text).strip()[:200]
+
+
+def _from_the_relay(resp: httpx.Response) -> bool:
+    """True if this error is the relay's own answer, not something in front of it.
+
+    A quick tunnel whose bridge has stopped still answers - Cloudflare sends an
+    HTML error page (530) - and so does any proxy or gateway. Only the relay
+    answers a 4xx with a JSON detail.
+    """
+    if not 400 <= resp.status_code < 500 or resp.status_code == 404:
+        return False
+    try:
+        data = resp.json()
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "detail" in data
+
+
+def register_name(url: str, room: str, token: str, name: str, key: str) -> None:
+    """Claim ``name`` in ``room`` for this machine's identity key, without going online.
+
+    Raises RelayRefused if the relay says no, RelayUnreachable if no relay answers.
+    """
+    url = url.rstrip("/")
+    body = join_body(room, name, key, register_only=True)
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        with http_client(timeout=15.0) as http:
+            resp = http.post(f"{url}/v1/join", json=body, headers=headers)
+            if resp.status_code == 409 and resp.headers.get(LEGACY_CLAIM_HEADER) == "1":
+                # Our own name from ccbridge 0.2: prove it with the hash 0.2 stored.
+                body["legacy_key_hash"] = legacy_key_hash(key)
+                resp = http.post(f"{url}/v1/join", json=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise RelayUnreachable(type(exc).__name__) from None
+    if resp.status_code == 200:
+        return
+    if not _from_the_relay(resp):
+        raise RelayUnreachable(f"HTTP {resp.status_code}")
+    raise RelayRefused(resp.status_code, _relay_detail(resp))
+
+
+def check_public_url(url: str, wait: float = PUBLIC_CHECK_SECONDS) -> Optional[str]:
+    """None once ``url`` reaches this relay; otherwise what went wrong last."""
+    deadline = time.monotonic() + wait
+    problem = "no answer"
+    with http_client(timeout=5.0) as http:
+        while True:
+            try:
+                resp = http.get(f"{url}/healthz")
+                data = resp.json() if resp.status_code == 200 else None
+                if isinstance(data, dict) and data.get("ok") is True:
+                    return None
+                problem = f"HTTP {resp.status_code}"
+            except (httpx.HTTPError, ValueError) as exc:
+                problem = type(exc).__name__
+            if time.monotonic() >= deadline:
+                return problem
+            time.sleep(1.0)
+
+
+# --- running the relay and the tunnel ------------------------------------------
+
+
+def _bind(port: int) -> socket.socket:
+    """Take the relay's port before anything else starts, or say who has it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if os.name != "nt":
+        # Lets a restarted host reuse the port at once. (On Windows the same
+        # option would let a second program bind the port alongside us.)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+        # Listening now is what holds the port: on Linux, a socket that is only
+        # bound does not stop a second one from binding it too.
+        sock.listen(128)
+    except OSError:
+        sock.close()
+        raise SetupError(
+            f"port {port} is already in use - is a bridge already running? Stop it first,"
+            " or set CCBRIDGE_PORT to another port"
+        ) from None
+    return sock
+
+
+def _prepare_database() -> None:
+    """The relay's database holds message text, so make it readable by you only."""
+    if not DB_FILE.exists():
+        # SQLite takes an empty file as an empty database, and gives its -wal
+        # and -shm files the same mode.
+        os.close(os.open(DB_FILE, os.O_WRONLY | os.O_CREAT, 0o600))
+    for path in (DB_FILE, DB_FILE.with_name(DB_FILE.name + "-wal"),
+                 DB_FILE.with_name(DB_FILE.name + "-shm")):
+        if path.exists():
+            _make_private(path)
+
+
+def build_relay(room: str, token: str, names: Optional[list[str]]):
+    """The relay app for one room. Its settings are passed in, never put in the
+    environment, which cloudflared and git would inherit - token included."""
+    from ccbridge.relay import create_app
+
+    _prepare_database()
+    try:
+        return create_app(str(DB_FILE), open_rooms=False, rooms={room: token},
+                          allowed_names=names or [])
+    except sqlite3.Error as exc:
+        raise SetupError(f"cannot open the relay's database {DB_FILE} ({exc})") from None
+
+
+def start_relay(sock: socket.socket, app):
+    """Serve ``app`` on ``sock`` from a background thread; return once it is up."""
+    import uvicorn
+
+    config = uvicorn.Config(app, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]},
+                              daemon=True, name="ccbridge-relay")
+    thread.start()
+    deadline = time.monotonic() + RELAY_START_SECONDS
+    while not server.started:
+        if not thread.is_alive() or time.monotonic() > deadline:
+            server.should_exit = True
+            raise SetupError("the relay did not start (see the error above)")
+        time.sleep(0.05)
+    return server, thread
+
+
+def stop_relay(server, thread: threading.Thread) -> None:
+    server.should_exit = True
+    thread.join(timeout=10)
+
+
+def serve_until_stopped(thread: threading.Thread) -> None:
+    """Block until Ctrl+C, or until the relay stops by itself."""
+    try:
+        while thread.is_alive():
+            thread.join(0.5)  # short waits, so Ctrl+C is noticed on Windows too
+        print("\nThe relay stopped.")
+    except KeyboardInterrupt:
+        print("\nStopping the bridge...")
+
+
+@contextlib.contextmanager
+def _stop_on_signals():
+    """Treat the usual ways of stopping a background process like Ctrl+C, so the
+    cleanup (removing the invite, stopping cloudflared) runs for them too.
+
+    A hard kill (SIGKILL, or TerminateProcess on Windows) cannot be caught: then
+    invite.txt stays until the next run, which removes it first thing.
+    """
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    names = ("SIGTERM", "SIGHUP", "SIGBREAK")  # SIGBREAK: Ctrl+Break on Windows
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for name in names:
+            if hasattr(signal, name):
+                try:
+                    previous[name] = signal.signal(getattr(signal, name), interrupt)
+                except (OSError, ValueError):
+                    pass
+    try:
+        yield
+    finally:
+        for name, handler in previous.items():
+            signal.signal(getattr(signal, name), handler)
 
 
 def _stop(proc: subprocess.Popen) -> None:
@@ -141,17 +589,25 @@ def _stop(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
-def start_tunnel() -> tuple[subprocess.Popen | None, str | None]:
+def tunnel_url_in(line: bytes) -> Optional[str]:
+    """The public URL, if this line of cloudflared output announces the tunnel."""
+    match = TUNNEL_URL_RE.search(line)
+    return match.group(0).decode() if match else None
+
+
+def start_tunnel(port: int = PORT) -> tuple[Optional[subprocess.Popen], Optional[str]]:
     """Start cloudflared and return ``(process, public URL)``.
 
     ``(None, None)`` means cloudflared is not installed. ``(process, None)`` means
     it is installed but produced no URL in time; the process is already stopped.
     """
-    exe = shutil.which("cloudflared")
+    exe = find_program("cloudflared")
     if not exe:
         return None, None
     proc = subprocess.Popen(
-        [exe, "tunnel", "--url", f"http://localhost:{PORT}"],
+        # 127.0.0.1, the address the relay holds - not "localhost", which may
+        # resolve to ::1, where another program could be listening on this port.
+        [exe, "tunnel", "--url", f"http://127.0.0.1:{port}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -160,9 +616,9 @@ def start_tunnel() -> tuple[subprocess.Popen | None, str | None]:
     def read() -> None:
         # Keep draining after the URL shows up, or cloudflared blocks on a full pipe.
         for line in proc.stdout:  # type: ignore[union-attr]
-            match = TUNNEL_URL_RE.search(line)
-            if match and not url:
-                url.append(match.group(0).decode())
+            found = tunnel_url_in(line)
+            if found and not url:
+                url.append(found)
 
     threading.Thread(target=read, daemon=True).start()
     deadline = time.monotonic() + TUNNEL_WAIT_SECONDS
@@ -174,104 +630,224 @@ def start_tunnel() -> tuple[subprocess.Popen | None, str | None]:
     return proc, None
 
 
-def _host_credentials() -> tuple[str, str]:
-    if TOKEN_FILE.exists():
-        parts = TOKEN_FILE.read_text(encoding="utf-8").split()
-        if len(parts) >= 2 and ROOM_RE.match(parts[0]):
-            return parts[0], parts[1]
-        raise SetupError(f"{TOKEN_FILE} is damaged - delete it and run host again"
-                         " (your friend will then need the new invite)")
-    room, token = f"bridge-{secrets.token_hex(4)}", secrets.token_urlsafe(32)
-    TOKEN_FILE.write_text(f"{room}\n{token}\n", encoding="utf-8")
-    return room, token
+# --- host ----------------------------------------------------------------------
 
 
-def _warn_if_inside_ccbridge() -> None:
-    if Path.cwd().resolve() == HERE:
-        print("Note: you ran this inside the ccbridge folder, so the bridge only loads when")
-        print("      Claude Code is opened here. To use it in your project, run this from")
-        print("      the project folder instead.\n")
-
-
-def cmd_host(name: str, allow: str | None) -> None:
-    check_name(name)
-    room, token = _host_credentials()
-
-    print("Starting bridge...\n")
-    proc, url = start_tunnel()
+def _current_bridge_room() -> Optional[str]:
+    """The room in this project's .mcp.json, as versions before 0.3 wrote it."""
     try:
-        if url:
-            print(f"Public URL : {url}")
-        else:
-            url = f"http://localhost:{PORT}"
-            if proc is None:
-                print("cloudflared not found, so this bridge is LOCAL ONLY.")
-                print("  Your friend cannot reach it until you install a tunnel:")
-                print("      winget install --id Cloudflare.cloudflared   (macOS: brew install cloudflared)")
+        config, _ = _load_mcp_config(Path.cwd() / ".mcp.json")
+    except SetupError:
+        return None
+    entry = config["mcpServers"].get("ccbridge")
+    env = entry.get("env") if isinstance(entry, dict) else None
+    room = env.get("CCBRIDGE_ROOM") if isinstance(env, dict) else None
+    return room if isinstance(room, str) else None
+
+
+def _legacy_room() -> Optional[tuple[str, str]]:
+    """The room ccbridge 0.2 hosted from this folder, if this project used it.
+
+    0.2 kept one room for the whole ccbridge folder. The first project to host
+    whose .mcp.json still uses that room takes it over (and the 0.2 file is then
+    retired), so a friend's name and unread messages survive the upgrade; every
+    other project gets a room of its own.
+    """
+    if not LEGACY_TOKEN_FILE.exists():
+        return None
+    _make_private(LEGACY_TOKEN_FILE)
+    try:
+        parts = LEGACY_TOKEN_FILE.read_text(encoding="utf-8-sig").split()
+    except (OSError, ValueError):
+        return None
+    if len(parts) < 2 or not ROOM_RE.match(parts[0]) or _current_bridge_room() != parts[0]:
+        return None
+    return parts[0], parts[1]
+
+
+def host_room(project: Path, new_room: bool) -> tuple[str, str, bool]:
+    """The room and token ``project`` hosts: the same on every run, unless ``new_room``.
+
+    The third value is True when that is 0.2's room, which the caller retires
+    once it is recorded as this project's.
+    """
+    legacy = None
+    if not new_room:
+        hosted = load_settings(project).get("hosted")
+        if isinstance(hosted, dict):
+            room, token = hosted.get("room"), hosted.get("token")
+            if (isinstance(room, str) and ROOM_RE.match(room)
+                    and isinstance(token, str) and len(token) >= 16):
+                return room, token, False
+        legacy = _legacy_room()
+        if legacy:
+            return legacy[0], legacy[1], True
+    elif _legacy_room():
+        # --new-room in the project that used 0.2's room: that room is the one
+        # being replaced, so no other project may take it over later.
+        _remove(LEGACY_TOKEN_FILE)
+    return f"bridge-{secrets.token_hex(4)}", secrets.token_urlsafe(32), False
+
+
+def cmd_host(name: str, allow: Optional[str], new_room: bool = False) -> None:
+    check_name(name)
+    project = Path.cwd()
+    _load_mcp_config(project / ".mcp.json")  # a broken .mcp.json stops us before anything runs
+    room, token, adopted_legacy = host_room(project, new_room)
+    key = identity_key()
+    members = list(dict.fromkeys([name] + (allow.split(",") if allow else [])))
+    # This relay serves exactly one room: anyone who stumbles on the tunnel URL
+    # cannot create rooms of their own on it. With --allow, only those names.
+    app = build_relay(room, token, members if allow else None)
+
+    sock = _bind(PORT)  # if a bridge is already running, this stops us - leaving its invite alone
+    port = sock.getsockname()[1]
+    local_url = f"http://127.0.0.1:{port}"
+    # An invite from an earlier run points at a dead tunnel. Remove it before the
+    # slow part (the tunnel), so nobody - person or agent - reads it as this run's.
+    _remove(INVITE_FILE)
+    print("Starting bridge...\n")
+    server = thread = proc = None
+    invite_line = None
+    try:
+        with _stop_on_signals():
+            server, thread = start_relay(sock, app)
+            # Claim your own name before anyone else can reach the relay.
+            try:
+                register_name(local_url, room, token, name, key)
+            except RelayRefused as exc:
+                hint = (" Pick another name, or start a fresh room with --new-room."
+                        if exc.status == 409 else "")
+                raise SetupError(f"could not claim '{name}' on your own relay: {exc.detail}{hint}") from None
+            except RelayUnreachable as exc:
+                raise SetupError(f"the relay on port {port} did not answer ({exc})") from None
+
+            # The host reaches its own relay directly. Going out through the tunnel and
+            # back would be slower, and would break outright on networks whose DNS does
+            # not resolve trycloudflare.com subdomains - which some ISPs do not.
+            path = write_mcp_config(local_url, room, token, name, peer=allow, key=key,
+                                    hosted={"room": room, "token": token})
+            if adopted_legacy:
+                _remove(LEGACY_TOKEN_FILE)  # 0.2's room now belongs to this project alone
+            notes = mcp_config_warnings()  # before the invite exists: it means "ready"
+
+            proc, url = start_tunnel(port)
+            if url:
+                print(f"Public URL : {url}")
+                problem = check_public_url(url)
+                if problem:
+                    print(f"  It did not answer from this machine yet ({problem}). Some networks do")
+                    print("  not resolve trycloudflare.com addresses - if your friend cannot connect")
+                    print("  either, see Troubleshooting in the README.")
+                print()
             else:
-                print(f"cloudflared did not produce a public URL within {TUNNEL_WAIT_SECONDS:.0f} seconds,")
-                print("so this bridge is LOCAL ONLY. Check your internet connection and firewall.")
-            print("  then run this command again.\n")
+                url = local_url
+                if proc is None:
+                    print("cloudflared not found, so this bridge is LOCAL ONLY.")
+                    print("  Your friend cannot reach it until you install a tunnel:")
+                    print("      winget install --id Cloudflare.cloudflared   (macOS: brew install cloudflared)")
+                else:
+                    print(f"cloudflared did not produce a public URL within {TUNNEL_WAIT_SECONDS:.0f} seconds,")
+                    print("so this bridge is LOCAL ONLY. Check your internet connection and firewall.")
+                print("  then run this command again.\n")
 
-        # The host reaches its own relay directly. Going out through the tunnel and
-        # back would be slower, and would break outright on networks whose DNS does
-        # not resolve trycloudflare.com subdomains - which some ISPs do not.
-        path = write_mcp_config(f"http://127.0.0.1:{PORT}", room, token, name, peer=allow)
-        invite_line = f"python bridge.py join {encode_invite(url, room, token)} <theirname>"
+            invite_line = f"python bridge.py join {encode_invite(url, room, token)} <theirname>"
+            # Also drop the invite on disk. This command is usually launched in a
+            # background shell (by a person or by an AI agent), where reading a file is
+            # far more reliable than scraping a still-running process's output. It
+            # lives next to this script, where .gitignore covers it, and is removed
+            # when the bridge stops.
+            _write_private(INVITE_FILE, invite_line + "\n")
 
-        # Also drop the invite on disk. This command is usually launched in a
-        # background shell (by a person or by an AI agent), where reading a file is
-        # far more reliable than scraping a still-running process's output. It
-        # lives next to this script, where .gitignore already covers it.
-        INVITE_FILE.write_text(invite_line + "\n", encoding="utf-8")
-
-        print(f"Wrote {path} (you are '{name}')\n")
-        _warn_if_inside_ccbridge()
-        print("=" * 62)
-        print("SEND THIS ONE LINE TO YOUR FRIEND (privately - it holds the room token):")
-        print()
-        print(f"  {invite_line}")
-        print()
-        print("=" * 62)
-        print(f"\nAlso saved to: {INVITE_FILE}")
-        print("Now restart Claude Code in this folder and approve the 'ccbridge' MCP server.")
-        print("Keep this window open. Ctrl+C to stop the bridge.\n")
-
-        os.environ["CCBRIDGE_DB"] = str(HERE / "ccbridge.db")
-        # This relay serves exactly one room. Anyone who stumbles on the tunnel
-        # URL cannot create rooms of their own on it.
-        os.environ["CCBRIDGE_ROOMS"] = f"{room}:{token}"
-        os.environ["CCBRIDGE_OPEN_ROOMS"] = "0"
-        sys.path.insert(0, str(HERE))
-        import uvicorn
-
-        uvicorn.run("ccbridge.relay:app_from_env", factory=True,
-                    host="127.0.0.1", port=PORT, log_level="warning")
+            print(f"Wrote {path} (you are '{name}')")
+            if allow:
+                print(f"Room locked: only {', '.join(members)} can join.\n")
+            else:
+                print("Tip: add --allow <their name> so nobody else can join, even with the invite.\n")
+            _warn_if_inside_ccbridge()
+            _print_notes(notes)
+            print("=" * 62)
+            print("SEND THIS ONE LINE TO YOUR FRIEND (privately - it holds the room token):")
+            print()
+            print(f"  {invite_line}")
+            print()
+            print("=" * 62)
+            print(f"\nAlso saved to: {INVITE_FILE}")
+            print("Now restart Claude Code in this folder and approve the 'ccbridge' MCP server.")
+            print("Keep this window open. Ctrl+C to stop the bridge.\n")
+            serve_until_stopped(thread)
     finally:
+        if server is not None:
+            stop_relay(server, thread)
+        sock.close()
         if proc is not None:
             _stop(proc)
+        # The invite dies with the tunnel. Leave the file alone if another run
+        # has written its own since.
+        if invite_line is not None and _read_or_none(INVITE_FILE) == invite_line + "\n":
+            _remove(INVITE_FILE)
 
 
-def cmd_join(invite: str, name: str, allow: str | None) -> None:
+# --- join ----------------------------------------------------------------------
+
+
+def _join_refused(exc: RelayRefused) -> SetupError:
+    if exc.status == 403 and exc.detail in ("Unknown room", "Bad room token"):
+        return SetupError("the bridge no longer accepts this invite - ask the host for"
+                          " the invite from their current run")
+    if exc.status == 409:
+        return SetupError(f"{exc.detail} Run join again with another name.")
+    if exc.status == 429:
+        return SetupError("the bridge is busy - try again in a minute")
+    return SetupError(f"the bridge refused to let you in ({exc.status}): {exc.detail}")
+
+
+# join's exit code when the settings were saved but no bridge answered.
+EXIT_UNREACHABLE = 2
+
+
+def cmd_join(invite: str, name: str, allow: Optional[str]) -> int:
+    """Join; returns the exit code (0, or EXIT_UNREACHABLE)."""
     check_name(name)
     url, room, token = decode_invite(invite)
-    path = write_mcp_config(url, room, token, name, peer=allow)
-    print(f"Joined bridge room '{room}' as '{name}'.")
+    _load_mcp_config(Path.cwd() / ".mcp.json")  # refuse a broken file before contacting anyone
+    key = identity_key()
+    # Claim the name now: a taken name or a stale invite shows up here, not
+    # later inside Claude Code.
+    unreachable = None
+    try:
+        register_name(url, room, token, name, key)
+    except RelayRefused as exc:
+        raise _join_refused(exc) from None
+    except RelayUnreachable as exc:
+        unreachable = str(exc)
+
+    path = write_mcp_config(url, room, token, name, peer=allow, key=key)
+    if unreachable:
+        print(f"No bridge answered at {url} ({unreachable}).")
+        print("  Usually the host's bridge has stopped, or this invite is from an earlier")
+        print("  run - a quick tunnel gets a new address every run. Ask the host for the")
+        print("  invite from their current run. (If it is current, see Troubleshooting in")
+        print("  the README.) Saved the settings anyway, in case the bridge comes back.\n")
+    else:
+        print(f"Joined bridge room '{room}' as '{name}'.")
     print(f"Wrote {path}\n")
     _warn_if_inside_ccbridge()
+    _print_notes(mcp_config_warnings())
     print("Now restart Claude Code in this folder, approve the 'ccbridge' MCP server")
     print("when it asks, then ask it:")
     print('    "check the bridge - who is online?"')
+    return EXIT_UNREACHABLE if unreachable else 0
 
 
-def _allow_list(raw: str | None) -> str | None:
+def _allow_list(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
     names = [check_name(n.strip()) for n in raw.split(",") if n.strip()]
     return ",".join(names) or None
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: Optional[list[str]] = None) -> None:
     # Python block-buffers stdout when it is not a terminal, so running `host` in
     # a background shell would hide the invite line until the buffer filled.
     try:
@@ -285,23 +861,32 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     host = sub.add_parser("host", help="start the relay and print an invite")
     host.add_argument("name", help="how you appear to your peer")
+    host.add_argument("--new-room", action="store_true",
+                      help="start a fresh room and token; earlier invites stop working")
     join = sub.add_parser("join", help="connect to someone else's relay")
     join.add_argument("invite", help="the invite string from the host")
     join.add_argument("name", help="how you appear to your peer")
-    for command in (host, join):
-        command.add_argument("--allow", metavar="NAME",
-                             help="only accept messages from this peer (comma-separate several)")
+    host.add_argument("--allow", metavar="NAME",
+                      help="only these peers (comma-separated) may join, and only their"
+                           " messages are accepted")
+    join.add_argument("--allow", metavar="NAME",
+                      help="only accept messages from this peer (comma-separate several)")
     args = parser.parse_args(argv)
 
+    code = 0
     try:
         allow = _allow_list(args.allow)
         if args.command == "host":
-            cmd_host(args.name, allow)
+            cmd_host(args.name, allow, new_room=args.new_room)
         else:
-            cmd_join(args.invite, args.name, allow)
+            code = cmd_join(args.invite, args.name, allow)
     except SetupError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    if code:
+        sys.exit(code)
 
 
 if __name__ == "__main__":

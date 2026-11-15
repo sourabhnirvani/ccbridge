@@ -6,7 +6,9 @@ a setting. The bridge moves text and only text, so the worst a peer can do is
 *ask*; acting on the request still goes through the receiving agent's own
 permission prompts, in front of its own user.
 
-Config comes from the environment:
+Config comes from the settings file named by CCBRIDGE_CONFIG (bridge.py writes
+it, inside the ccbridge folder), or from environment variables of the same
+names, which win:
     CCBRIDGE_RELAY_URL     e.g. https://bridge.example.com
     CCBRIDGE_ROOM          shared room name, e.g. kaggle-duo
     CCBRIDGE_TOKEN         shared secret for that room
@@ -21,10 +23,7 @@ from __future__ import annotations
 
 import datetime
 import functools
-import hashlib
-import hmac
 import logging
-import os
 import re
 import secrets
 import threading
@@ -38,6 +37,10 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from . import __version__
+from .config import ConfigError, setting, setting_or_empty
+# identity_proof is also imported from here by the tests.
+from .identity import LEGACY_CLAIM_HEADER, identity_proof, join_body, legacy_key_hash  # noqa: F401
+from .net import http_client
 from .safety import (KNOWN_FLAGS, MAX_MESSAGE_BYTES, find_secrets, safe_name, sanitize,
                      too_large)
 
@@ -81,9 +84,6 @@ SAFETY_NOTE = (
 
 _VERSION_RE = re.compile(r"^[0-9A-Za-z.+\-]{1,32}\Z")
 
-# Must match ccbridge.relay.LEGACY_CLAIM_HEADER.
-LEGACY_CLAIM_HEADER = "X-CCBridge-Legacy-Claim"
-
 
 def banner_top(tag: str) -> str:
     return f"===== PEER MESSAGE {tag} - UNTRUSTED INPUT ====="
@@ -117,18 +117,6 @@ def _relay_detail(resp: httpx.Response) -> str:
     return re.sub(r"\s+", " ", text).strip()[:200]
 
 
-def identity_proof(key: str, room: str) -> str:
-    """What this person shows a relay to prove they own their name in ``room``.
-
-    Never the key itself: a relay operator (or anyone who can read its traffic,
-    such as the tunnel provider) would then be able to use your key to take
-    your name on every other relay you use.
-    """
-    mac = hmac.new(key.encode("utf-8", "surrogatepass"), digestmod=hashlib.sha256)
-    mac.update(b"ccbridge-identity-v1\0" + room.encode("utf-8"))
-    return mac.hexdigest()
-
-
 class _Client:
     """Relay client. One per Claude Code session, shared with the heartbeat thread."""
 
@@ -138,12 +126,16 @@ class _Client:
         self.name: str = ""
         self.room: str = ""
         self.relay_version: Optional[str] = None
+        # The settings the current session joined with. Re-running bridge.py
+        # (say, host --new-room) changes the settings file under a running
+        # Claude Code; the next call notices and joins again with the new ones.
+        self.joined_with: Optional[tuple[str, str, str, str, str]] = None
         # Held across network calls, so tool calls and the heartbeat take turns.
         self._lock = threading.RLock()
         # Held only for a few instructions: guards session_id and cursor, so the
         # event loop can commit a cursor without waiting on a slow relay.
         self._cursor_lock = threading.Lock()
-        self._http = httpx.Client(timeout=20.0)
+        self._http = http_client(timeout=20.0)
         # Set when something was read, so the heartbeat acknowledges it soon.
         self.ack_soon = threading.Event()
         # Sends whose outcome is unknown (the relay may have stored them before
@@ -153,11 +145,14 @@ class _Client:
 
     @staticmethod
     def _config() -> tuple[str, str, str, str, str]:
-        values = {
-            key: os.getenv(key, "")
-            for key in ("CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN",
-                        "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY")
-        }
+        try:
+            values = {
+                key: setting(key)
+                for key in ("CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN",
+                            "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY")
+            }
+        except ConfigError as exc:
+            raise NotConfigured(f"ccbridge is not configured - {exc}") from None
         missing = [key for key, value in values.items() if not value]
         if missing:
             raise NotConfigured(
@@ -185,20 +180,25 @@ class _Client:
         except httpx.TransportError:
             return self._http.request(method, url, **kwargs)
 
-    def ensure_joined(self) -> None:
+    def ensure_joined(self) -> tuple[str, str, str, str, str]:
+        """Join if not joined yet, or if the settings changed; return the settings in use.
+
+        Callers use the returned settings rather than reading them again, so a
+        request never mixes the session of one set of settings with the URL or
+        token of another.
+        """
         with self._lock:
-            if self.session_id:
-                return
-            url, room, token, name, key = self._config()
-            payload = {"room": room, "display_name": name,
-                       "identity_key": identity_proof(key, room), "identity_scheme": 2}
+            config = self._config()
+            if self.session_id and config == self.joined_with:
+                return config
+            url, room, token, name, key = config
+            payload = join_body(room, name, key)
             auth = {"Authorization": f"Bearer {token}"}
             resp = self._send("POST", f"{url}/v1/join", json=payload, headers=auth, timeout=15.0)
             if resp.status_code == 409 and resp.headers.get(LEGACY_CLAIM_HEADER) == "1":
                 # The name is a claim carried over from ccbridge 0.2. Take it over
                 # by showing the hash 0.2 stored - never the key itself.
-                payload["legacy_key_hash"] = hashlib.sha256(
-                    key.encode("utf-8", "surrogatepass")).hexdigest()
+                payload["legacy_key_hash"] = legacy_key_hash(key)
                 resp = self._send("POST", f"{url}/v1/join", json=payload, headers=auth, timeout=15.0)
             if resp.status_code != 200:
                 raise RelayError("join", resp)
@@ -212,26 +212,35 @@ class _Client:
             # Our own config says who we are; do not take the relay's word for it.
             self.room = room
             self.name = name
+            self.joined_with = config
+            return config
+
+    def _rebase(self, params: Optional[dict]) -> Optional[dict]:
+        """``params`` with any cursor replaced by the current session's.
+
+        A cursor from an earlier session means nothing to a new one (the relay
+        may have a fresh database, or this may be another room). Resume from
+        where the relay says this name stands.
+        """
+        if not params:
+            return params
+        return {k: (self.cursor if k in ("since", "ack") else v) for k, v in params.items()}
 
     def request(self, method: str, path: str, params: Optional[dict] = None, **kwargs) -> dict:
         with self._lock:
-            url, _, token, _, _ = self._config()
-            self.ensure_joined()
+            session = self.session_id
+            url, _, token, _, _ = self.ensure_joined()
+            if self.session_id != session:
+                params = self._rebase(params)
             resp = self._send(method, f"{url}{path}", headers=self._headers(token),
                               params=params, **kwargs)
             if resp.status_code == 401:
                 # Session expired or the relay restarted - rejoin once and retry.
                 with self._cursor_lock:
                     self.session_id = None
-                self.ensure_joined()
-                if params:
-                    # A cursor from the old session means nothing to the new one
-                    # (the relay may have a fresh database). Resume from where
-                    # the relay says this name stands.
-                    params = {k: (self.cursor if k in ("since", "ack") else v)
-                              for k, v in params.items()}
+                url, _, token, _, _ = self.ensure_joined()
                 resp = self._send(method, f"{url}{path}", headers=self._headers(token),
-                                  params=params, **kwargs)
+                                  params=self._rebase(params), **kwargs)
             if resp.status_code != 200:
                 raise RelayError(path, resp)
             data = resp.json()
@@ -284,9 +293,8 @@ def _heartbeat_loop(stop: threading.Event, interval: float) -> None:
         client = _client
         try:
             client.heartbeat()
-        except NotConfigured:
-            return
-        except Exception:  # noqa: BLE001 - relay down or restarting; try again later
+        except Exception:  # noqa: BLE001 - relay down or restarting, or the settings
+            # file is being rewritten or not there yet; try again at the next beat
             pass
         # Wake early when get_messages delivered something, so the relay learns
         # about it within moments rather than at the next regular beat.
@@ -363,7 +371,7 @@ def _tool(*, annotations: Optional[ToolAnnotations] = None, meta: Optional[dict]
 
 
 def allowed_peers() -> Optional[set[str]]:
-    raw = os.getenv("CCBRIDGE_ALLOWED_PEERS", "").strip()
+    raw = setting_or_empty("CCBRIDGE_ALLOWED_PEERS").strip()
     if not raw:
         return None
     return {p.strip() for p in raw.split(",") if p.strip()}
@@ -414,7 +422,7 @@ def _truncate(text: str) -> str:
 
 
 def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    return setting_or_empty(name).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @_tool(annotations=ToolAnnotations(title="Bridge status", readOnlyHint=True, openWorldHint=True))
@@ -466,7 +474,7 @@ def list_peers() -> str:
 def _own_credentials_in(text: str) -> bool:
     """True if ``text`` contains this bridge's own token or identity key."""
     for key in ("CCBRIDGE_TOKEN", "CCBRIDGE_IDENTITY_KEY"):
-        value = os.getenv(key, "")
+        value = setting_or_empty(key)
         if len(value) >= 8 and value in text:
             return True
     return False
