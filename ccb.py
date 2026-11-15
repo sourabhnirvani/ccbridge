@@ -671,12 +671,16 @@ class HubServer(ThreadingHTTPServer):
 
 
 def open_server(hub: Hub, port: int) -> HubServer:
-    try:
-        return HubServer(("127.0.0.1", port), make_handler(hub))
-    except OSError:
-        if port == 0:
-            raise
-        return HubServer(("127.0.0.1", 0), make_handler(hub))  # the usual port is taken: any free one
+    deadline = time.monotonic() + (5.0 if port else 0.0)  # a hub stopped a moment ago may still hold it
+    while True:
+        try:
+            return HubServer(("127.0.0.1", port), make_handler(hub))
+        except OSError:
+            if port == 0:
+                raise
+            if time.monotonic() > deadline:
+                return HubServer(("127.0.0.1", 0), make_handler(hub))  # the usual port is taken: any free one
+            time.sleep(0.25)
 
 
 def find_cloudflared() -> Optional[str]:
