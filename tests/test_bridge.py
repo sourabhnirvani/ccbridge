@@ -715,3 +715,186 @@ def test_stop_signals_run_the_cleanup():
         with bridge._stop_on_signals():
             signal.raise_signal(signal.SIGTERM)
     assert signal.getsignal(signal.SIGTERM) == before
+
+
+# --- more AI tools: connect, --client, --local, --max-members ---------------------
+
+
+@pytest.fixture()
+def tools(in_tmp, tmp_path, monkeypatch):
+    """A scratch home folder, and no Codex CLI, so nothing outside tmp_path is touched."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(home))
+    monkeypatch.setenv("CODEX_HOME", "")
+    monkeypatch.delenv("CODEX_HOME")
+    real = bridge.find_program
+    monkeypatch.setattr(bridge, "find_program", lambda name: None if name == "codex" else real(name))
+    return home
+
+
+def client_settings(project, client):
+    return json.loads(bridge.client_settings_path(project, client).read_text(encoding="utf-8"))
+
+
+def test_host_with_no_client_flag_writes_exactly_what_it_did_before(in_tmp, host, tools):
+    host()
+    assert (in_tmp / ".mcp.json").exists()
+    assert sorted(p.name for p in bridge.PROJECTS_DIR.iterdir()) == [bridge.settings_path(in_tmp).name]
+    assert not (in_tmp / ".cursor").exists()
+    s = settings(in_tmp)
+    assert s["CCBRIDGE_NAME"] == "sourabh" and s["CCBRIDGE_CLIENT"] == "claude-code"
+    assert s["CCBRIDGE_PROJECT_DIR"] == str(in_tmp.resolve())
+
+
+def test_connect_gives_every_tool_its_own_name_and_settings(in_tmp, host, tools):
+    def connect_then_probe():
+        assert bridge.cmd_connect("cursor,grok,antigravity", None) == 0
+        key = settings(in_tmp)["CCBRIDGE_IDENTITY_KEY"]
+        seen = {n: join_as(in_tmp, n, key, register_only=True).status_code
+                for n in ("sourabh-cursor", "sourabh-grok", "sourabh-antigravity")}
+        seen["impostor"] = join_as(in_tmp, "sourabh-cursor", "some-other-key-0123456789",
+                                   register_only=True).status_code
+        return seen
+
+    # One identity key may own several names in a room; nobody else may take them.
+    assert host(while_up=connect_then_probe) == {"sourabh-cursor": 200, "sourabh-grok": 200,
+                                                  "sourabh-antigravity": 200, "impostor": 409}
+    files = {bridge.client_settings_path(in_tmp, c) for c in ("claude-code", "cursor", "grok", "antigravity")}
+    assert len(files) == 4
+    for client in ("cursor", "grok", "antigravity"):
+        s = client_settings(in_tmp, client)
+        assert s["CCBRIDGE_NAME"] == f"sourabh-{client}" and s["CCBRIDGE_CLIENT"] == client
+        assert s["CCBRIDGE_PROJECT_DIR"] == str(in_tmp.resolve())
+        assert s["CCBRIDGE_ROOM"] == settings(in_tmp)["CCBRIDGE_ROOM"]
+        assert "hosted" not in s
+    assert settings(in_tmp)["CCBRIDGE_NAME"] == "sourabh"  # Claude Code's is unchanged
+
+
+CLIENT_FILES = {"cursor": ".cursor/mcp.json", "vscode": ".vscode/mcp.json", "opencode": "opencode.json",
+                "kiro": ".kiro/settings/mcp.json", "gemini": ".gemini/settings.json",
+                "grok": ".grok/config.toml"}
+
+
+def test_client_configs_hold_no_secret_and_name_their_own_settings(in_tmp, host, tools):
+    host(while_up=lambda: bridge.cmd_connect(",".join(CLIENT_FILES) + ",windsurf", None))
+    token, key = settings(in_tmp)["CCBRIDGE_TOKEN"], settings(in_tmp)["CCBRIDGE_IDENTITY_KEY"]
+    written = {c: in_tmp / f for c, f in CLIENT_FILES.items()}
+    written["windsurf"] = tools / ".codeium/windsurf/mcp_config.json"
+    for client, path in written.items():
+        text = path.read_text(encoding="utf-8")
+        assert token not in text and key not in text, path
+        own = str(bridge.client_settings_path(in_tmp, client))
+        assert own in text or json.dumps(own)[1:-1] in text, path
+    ignored = (in_tmp / ".gitignore").read_text(encoding="utf-8").split()
+    for entry in [".mcp.json", *CLIENT_FILES.values()]:
+        assert entry in ignored
+
+
+def test_user_wide_entries_name_the_project(in_tmp, host, tools):
+    host(while_up=lambda: bridge.cmd_connect("windsurf", None))
+    servers = json.loads((tools / ".codeium/windsurf/mcp_config.json").read_text(encoding="utf-8"))["mcpServers"]
+    (name,) = servers
+    assert name == "ccbridge-" + bridge.settings_path(in_tmp).stem.replace(".", "-")
+    assert servers[name]["env"] == {"CCBRIDGE_CONFIG": str(bridge.client_settings_path(in_tmp, "windsurf"))}
+
+
+def test_connect_name_override(in_tmp, host, tools):
+    host(while_up=lambda: bridge.cmd_connect("cursor", "reviewer"))
+    assert client_settings(in_tmp, "cursor")["CCBRIDGE_NAME"] == "reviewer"
+
+
+def test_connect_before_host_or_join_says_what_to_do(in_tmp, tools):
+    with pytest.raises(SetupError, match="not on a bridge yet"):
+        bridge.cmd_connect("cursor", None)
+
+
+def test_a_name_too_long_with_the_client_suffix_is_refused(in_tmp, tools):
+    with pytest.raises(SetupError, match="pick a shorter one with --name"):
+        bridge._client_names("x" * 60, ["antigravity"])
+
+
+def test_connect_into_a_locked_room_explains_the_lock(in_tmp, host, tools):
+    def connect_cursor():
+        with pytest.raises(SetupError, match="--client cursor"):
+            bridge.cmd_connect("cursor", None)
+
+    host(allow="alex", while_up=connect_cursor)
+
+
+def test_host_with_clients_lets_them_into_its_locked_room(in_tmp, host, tools, monkeypatch):
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", "alex", clients=["claude-code", "cursor"])
+    assert client_settings(in_tmp, "cursor")["CCBRIDGE_NAME"] == "sourabh-cursor"
+    assert (in_tmp / ".mcp.json").exists() and (in_tmp / ".cursor/mcp.json").exists()
+
+
+def test_host_without_claude_code_leaves_mcp_json_alone(in_tmp, host, tools, monkeypatch):
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", None, clients=["cursor"])
+    assert not (in_tmp / ".mcp.json").exists()
+    assert client_settings(in_tmp, "cursor")["CCBRIDGE_NAME"] == "sourabh-cursor"
+    assert settings(in_tmp)["hosted"]  # the project's record is kept all the same
+
+
+def test_join_with_clients(in_tmp, host, tools, friend_project):
+    def join_with_two():
+        invite = invite_for(in_tmp)
+        friend = friend_project()
+        assert bridge.cmd_join(invite, "alex", None, clients=["claude-code", "opencode"]) == 0
+        return friend
+
+    friend = host(while_up=join_with_two)
+    assert json.loads((friend / "opencode.json").read_text(encoding="utf-8"))["mcp"]["ccbridge"]["type"] == "local"
+    assert client_settings(friend, "opencode")["CCBRIDGE_NAME"] == "alex-opencode"
+    assert settings(friend)["CCBRIDGE_NAME"] == "alex"
+
+
+def test_host_local_never_starts_a_tunnel(in_tmp, tools, monkeypatch, capsys):
+    def no_tunnel(port=0):
+        raise AssertionError("--local must not start cloudflared")
+
+    monkeypatch.setattr(bridge, "start_tunnel", no_tunnel)
+    monkeypatch.setattr(bridge, "serve_until_stopped", lambda thread: None)
+    bridge.cmd_host("sourabh", None, local=True)
+    assert "LOCAL ONLY (--local)" in capsys.readouterr().out
+
+
+def test_max_members_needs_a_relay_that_supports_it(in_tmp):
+    import inspect
+
+    from ccbridge import relay
+
+    if "max_members" in inspect.signature(relay.create_app).parameters:
+        pytest.skip("this relay already supports max_members")
+    with pytest.raises(SetupError, match="no member limit"):
+        bridge.build_relay("room1", "t" * 20, None, max_members=5)
+
+
+def test_max_members_is_passed_to_the_relay(in_tmp, monkeypatch):
+    from ccbridge import relay
+
+    seen = {}
+
+    def create_app(db_path, open_rooms=None, rooms=None, allowed_names=None, max_members=None):
+        seen["max_members"] = max_members
+        return "app"
+
+    monkeypatch.setattr(relay, "create_app", create_app)
+    assert bridge.build_relay("room1", "t" * 20, None, max_members=5) == "app"
+    assert seen == {"max_members": 5}
+
+
+def test_clients_command_lists_every_client(in_tmp, tools, capsys):
+    bridge.main(["clients"])
+    out = capsys.readouterr().out
+    for slug in bridge.CLIENTS:
+        assert slug in out
+
+
+def test_unknown_client_is_a_friendly_error(in_tmp, tools, capsys):
+    with pytest.raises(SystemExit) as exit_:
+        bridge.main(["connect", "--client", "emacs"])
+    assert exit_.value.code == 1
+    assert "unknown client 'emacs'" in capsys.readouterr().err

@@ -9,6 +9,15 @@ also locks the room: nobody else can join, even with the invite. Add --new-room
 to host to start over with a fresh room and token, for example after an invite
 leaked.
 
+Other AI coding tools (Cursor, Codex, Grok, VS Code, ...) can be on the bridge
+too, each under a name of its own - see docs/CLIENTS.md:
+
+    python <ccbridge>/bridge.py clients                     # supported tools, and which are installed
+    python <ccbridge>/bridge.py host <yourname> --client claude-code,cursor
+    python <ccbridge>/bridge.py connect --client codex,grok # later, in a project that ran host/join
+
+Add --local to host for tools on this computer only (no tunnel).
+
 Everything either side needs - relay URL, room, token - is packed into the single
 invite string, so nobody has to copy three separate values into a config file.
 The token and your identity key are kept in a settings file inside the ccbridge
@@ -39,6 +48,8 @@ from typing import Optional
 
 import httpx
 
+from ccbridge.clients import (CLIENTS, DEFAULT_CLIENT, MANAGED_ENV, ClientError, config_path,
+                              is_installed, parse_clients, register, server_name)
 from ccbridge.identity import LEGACY_CLAIM_HEADER, join_body, legacy_key_hash
 from ccbridge.net import http_client
 from ccbridge.safety import NAME_RE, ROOM_RE
@@ -68,8 +79,7 @@ LAUNCHER = HERE / "run_mcp_server.py"
 
 # Keys of the 'ccbridge' entry's env in .mcp.json that this script manages. Any
 # other key there (CCBRIDGE_CONFIRM_SENDS, say) is the user's and is kept.
-_MANAGED_ENV = {"CCBRIDGE_CONFIG", "CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN",
-                "CCBRIDGE_NAME", "CCBRIDGE_IDENTITY_KEY", "CCBRIDGE_ALLOWED_PEERS", "PYTHONPATH"}
+_MANAGED_ENV = MANAGED_ENV
 
 
 class SetupError(Exception):
@@ -224,6 +234,34 @@ def settings_path(project: Path) -> Path:
     return PROJECTS_DIR / f"{slug}-{digest}.json"
 
 
+def client_settings_path(project: Path, client: str) -> Path:
+    """The settings file ``client`` uses in ``project``.
+
+    Claude Code keeps the project's own file. Every other tool gets a file of
+    its own, with a name of its own: two tools sharing one would join as the same
+    member and take each other's messages.
+    """
+    base = settings_path(project)
+    return base if client == DEFAULT_CLIENT else base.with_name(f"{base.stem}-{client}.json")
+
+
+def client_name(base: str, client: str) -> str:
+    """The name ``client`` appears under: yours for Claude Code, else ``<yours>-<client>``."""
+    return base if client == DEFAULT_CLIENT else f"{base}-{client}"
+
+
+def _client_names(base: str, clients: list[str], override: Optional[str] = None) -> dict[str, str]:
+    if override and len(clients) == 1:
+        names = {clients[0]: override}
+    else:
+        names = {c: client_name(override or base, c) for c in clients}
+    for name in names.values():
+        if not NAME_RE.match(name):
+            raise SetupError(f"{name!r} is not a usable name - names are up to 64 letters, digits,"
+                             " spaces, '_', '.' or '-'; pick a shorter one with --name")
+    return names
+
+
 def _moved_settings(project: Path) -> Optional[Path]:
     """The settings file of the folder this project was moved or renamed from, if any.
 
@@ -306,12 +344,17 @@ def _ensure_gitignored(entry: str) -> None:
 
 
 def write_mcp_config(url: str, room: str, token: str, name: str, peer: Optional[str],
-                     key: Optional[str] = None, *, hosted: Optional[dict] = None) -> Path:
+                     key: Optional[str] = None, *, hosted: Optional[dict] = None,
+                     write_file: bool = True) -> Path:
     """Point Claude Code in the current folder at the bridge; returns .mcp.json's path.
 
     The token and identity key go into this project's settings file, which only
     you can read; .mcp.json gets nothing but that file's path. ``hosted``
     records the room this project hosts, so the next ``host`` here reuses it.
+
+    That settings file is also the project's record of its bridge, which
+    ``connect`` copies for other tools. With ``write_file`` False only it is
+    written, and .mcp.json is left alone (Claude Code was not asked for).
     """
     project = Path.cwd()
     path = project / ".mcp.json"
@@ -327,6 +370,8 @@ def write_mcp_config(url: str, room: str, token: str, name: str, peer: Optional[
         "CCBRIDGE_TOKEN": token,
         "CCBRIDGE_NAME": name,
         "CCBRIDGE_IDENTITY_KEY": key or identity_key(),
+        "CCBRIDGE_CLIENT": DEFAULT_CLIENT,
+        "CCBRIDGE_PROJECT_DIR": str(project.resolve()),
         "project": str(project.resolve()),
     }
     if peer:
@@ -337,6 +382,10 @@ def write_mcp_config(url: str, room: str, token: str, name: str, peer: Optional[
     settings_file = settings_path(project)
     moved_from = _settings_file(project)
     _write_private(settings_file, json.dumps(settings, indent=2) + "\n")
+    if not write_file:
+        if moved_from != settings_file:
+            _remove(moved_from)
+        return path
 
     servers = config["mcpServers"]
     old = servers.get("ccbridge")
@@ -352,6 +401,57 @@ def write_mcp_config(url: str, room: str, token: str, name: str, peer: Optional[
     # No secret in it any more, but its ccbridge entry only works on this machine.
     _ensure_gitignored(".mcp.json")
     return path
+
+
+def write_client(project: Path, client: str, name: str, base: dict) -> tuple[Path, Optional[Path]]:
+    """Point ``client`` in ``project`` at the bridge in ``base`` (the project's
+    settings), as ``name``. Returns the config file written, and its backup if
+    one was made. Claude Code's is .mcp.json, written by write_mcp_config."""
+    if client == DEFAULT_CLIENT:
+        path = write_mcp_config(base["CCBRIDGE_RELAY_URL"], base["CCBRIDGE_ROOM"],
+                                base["CCBRIDGE_TOKEN"], name, base.get("CCBRIDGE_ALLOWED_PEERS"),
+                                key=base.get("CCBRIDGE_IDENTITY_KEY"))
+        return path, None
+    spec = CLIENTS[client]
+    resolved = str(project.resolve())
+    settings = {k: v for k, v in base.items() if k.startswith("CCBRIDGE_")}
+    settings.update(CCBRIDGE_NAME=name, CCBRIDGE_CLIENT=client,
+                    CCBRIDGE_PROJECT_DIR=resolved, project=resolved)
+    settings_file = client_settings_path(project, client)
+    _write_private(settings_file, json.dumps(settings, indent=2) + "\n")
+    entry = server_name(spec, settings_path(project).stem)
+    try:
+        path, copy = register(spec, project, entry, sys.executable, [str(LAUNCHER)],
+                              {"CCBRIDGE_CONFIG": str(settings_file)}, find_program)
+    except ClientError as exc:
+        raise SetupError(str(exc)) from None
+    if not spec.user_wide:
+        _ensure_gitignored(path.relative_to(project).as_posix())
+    return path, copy
+
+
+def _claim_names(url: str, room: str, token: str, names: dict[str, str], key: str) -> Optional[str]:
+    """Claim every name in ``names`` (client -> name). Returns why the relay could
+    not be reached, if it could not; raises SetupError if it said no."""
+    for client, name in names.items():
+        try:
+            register_name(url, room, token, name, key)
+        except RelayUnreachable as exc:
+            return str(exc)
+        except RelayRefused as exc:
+            if exc.status == 403 and "only lets in" in exc.detail:
+                raise SetupError(
+                    f"the room is locked, and '{name}' is not one of the names its host let in."
+                    f" Ask the host to restart with --client {client} (or --allow {name}).") from None
+            raise _join_refused(exc) from None
+    return None
+
+
+def _print_restart(clients: list[str], paths: dict[str, Path]) -> None:
+    for client in clients:
+        spec = CLIENTS[client]
+        print(f"  {spec.display:<26} {paths[client]}")
+    print("\nNow restart each of those in this folder and approve its ccbridge MCP server.")
 
 
 def _git(*args: str) -> Optional[subprocess.CompletedProcess]:
@@ -507,15 +607,24 @@ def _prepare_database() -> None:
             _make_private(path)
 
 
-def build_relay(room: str, token: str, names: Optional[list[str]]):
+def build_relay(room: str, token: str, names: Optional[list[str]],
+                max_members: Optional[int] = None):
     """The relay app for one room. Its settings are passed in, never put in the
     environment, which cloudflared and git would inherit - token included."""
+    import inspect
+
     from ccbridge.relay import create_app
 
+    extra = {}
+    if max_members is not None:
+        if "max_members" not in inspect.signature(create_app).parameters:
+            raise SetupError("this version of the relay has no member limit yet;"
+                             " run host without --max-members")
+        extra["max_members"] = max_members
     _prepare_database()
     try:
         return create_app(str(DB_FILE), open_rooms=False, rooms={room: token},
-                          allowed_names=names or [])
+                          allowed_names=names or [], **extra)
     except sqlite3.Error as exc:
         raise SetupError(f"cannot open the relay's database {DB_FILE} ({exc})") from None
 
@@ -689,16 +798,20 @@ def host_room(project: Path, new_room: bool) -> tuple[str, str, bool]:
     return f"bridge-{secrets.token_hex(4)}", secrets.token_urlsafe(32), False
 
 
-def cmd_host(name: str, allow: Optional[str], new_room: bool = False) -> None:
+def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
+             clients: Optional[list[str]] = None, local: bool = False,
+             max_members: Optional[int] = None) -> None:
     check_name(name)
+    clients = clients or [DEFAULT_CLIENT]
+    names = _client_names(name, clients)
     project = Path.cwd()
     _load_mcp_config(project / ".mcp.json")  # a broken .mcp.json stops us before anything runs
     room, token, adopted_legacy = host_room(project, new_room)
     key = identity_key()
-    members = list(dict.fromkeys([name] + (allow.split(",") if allow else [])))
+    members = list(dict.fromkeys(list(names.values()) + (allow.split(",") if allow else [])))
     # This relay serves exactly one room: anyone who stumbles on the tunnel URL
     # cannot create rooms of their own on it. With --allow, only those names.
-    app = build_relay(room, token, members if allow else None)
+    app = build_relay(room, token, members if allow else None, max_members=max_members)
 
     sock = _bind(PORT)  # if a bridge is already running, this stops us - leaving its invite alone
     port = sock.getsockname()[1]
@@ -712,26 +825,33 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False) -> None:
     try:
         with _stop_on_signals():
             server, thread = start_relay(sock, app)
-            # Claim your own name before anyone else can reach the relay.
-            try:
-                register_name(local_url, room, token, name, key)
-            except RelayRefused as exc:
-                hint = (" Pick another name, or start a fresh room with --new-room."
-                        if exc.status == 409 else "")
-                raise SetupError(f"could not claim '{name}' on your own relay: {exc.detail}{hint}") from None
-            except RelayUnreachable as exc:
-                raise SetupError(f"the relay on port {port} did not answer ({exc})") from None
+            # Claim your own names (one per tool) before anyone else can reach the relay.
+            for own in names.values():
+                try:
+                    register_name(local_url, room, token, own, key)
+                except RelayRefused as exc:
+                    hint = (" Pick another name, or start a fresh room with --new-room."
+                            if exc.status == 409 else "")
+                    raise SetupError(f"could not claim '{own}' on your own relay: {exc.detail}{hint}") from None
+                except RelayUnreachable as exc:
+                    raise SetupError(f"the relay on port {port} did not answer ({exc})") from None
 
             # The host reaches its own relay directly. Going out through the tunnel and
             # back would be slower, and would break outright on networks whose DNS does
             # not resolve trycloudflare.com subdomains - which some ISPs do not.
             path = write_mcp_config(local_url, room, token, name, peer=allow, key=key,
-                                    hosted={"room": room, "token": token})
+                                    hosted={"room": room, "token": token},
+                                    write_file=DEFAULT_CLIENT in clients)
+            paths = {DEFAULT_CLIENT: path}
+            base = load_settings(project)
+            for client in clients:
+                if client != DEFAULT_CLIENT:
+                    paths[client] = write_client(project, client, names[client], base)[0]
             if adopted_legacy:
                 _remove(LEGACY_TOKEN_FILE)  # 0.2's room now belongs to this project alone
             notes = mcp_config_warnings()  # before the invite exists: it means "ready"
 
-            proc, url = start_tunnel(port)
+            proc, url = (None, None) if local else start_tunnel(port)
             if url:
                 print(f"Public URL : {url}")
                 problem = check_public_url(url)
@@ -742,14 +862,17 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False) -> None:
                 print()
             else:
                 url = local_url
-                if proc is None:
+                if local:
+                    print("LOCAL ONLY (--local): only programs on this computer can reach this bridge.\n")
+                elif proc is None:
                     print("cloudflared not found, so this bridge is LOCAL ONLY.")
                     print("  Your friend cannot reach it until you install a tunnel:")
                     print("      winget install --id Cloudflare.cloudflared   (macOS: brew install cloudflared)")
                 else:
                     print(f"cloudflared did not produce a public URL within {TUNNEL_WAIT_SECONDS:.0f} seconds,")
                     print("so this bridge is LOCAL ONLY. Check your internet connection and firewall.")
-                print("  then run this command again.\n")
+                if not local:
+                    print("  then run this command again.\n")
 
             invite_line = f"python bridge.py join {encode_invite(url, room, token)} <theirname>"
             # Also drop the invite on disk. This command is usually launched in a
@@ -759,7 +882,11 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False) -> None:
             # when the bridge stops.
             _write_private(INVITE_FILE, invite_line + "\n")
 
-            print(f"Wrote {path} (you are '{name}')")
+            if clients == [DEFAULT_CLIENT]:
+                print(f"Wrote {path} (you are '{name}')")
+            else:
+                for client in clients:
+                    print(f"Wrote {paths[client]} ({CLIENTS[client].display} is '{names[client]}')")
             if allow:
                 print(f"Room locked: only {', '.join(members)} can join.\n")
             else:
@@ -773,7 +900,8 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False) -> None:
             print()
             print("=" * 62)
             print(f"\nAlso saved to: {INVITE_FILE}")
-            print("Now restart Claude Code in this folder and approve the 'ccbridge' MCP server.")
+            restart = ", ".join(CLIENTS[c].display for c in clients)
+            print(f"Now restart {restart} in this folder and approve the ccbridge MCP server.")
             print("Keep this window open. Ctrl+C to stop the bridge.\n")
             serve_until_stopped(thread)
     finally:
@@ -806,23 +934,26 @@ def _join_refused(exc: RelayRefused) -> SetupError:
 EXIT_UNREACHABLE = 2
 
 
-def cmd_join(invite: str, name: str, allow: Optional[str]) -> int:
+def cmd_join(invite: str, name: str, allow: Optional[str],
+             clients: Optional[list[str]] = None) -> int:
     """Join; returns the exit code (0, or EXIT_UNREACHABLE)."""
     check_name(name)
+    clients = clients or [DEFAULT_CLIENT]
+    names = _client_names(name, clients)
     url, room, token = decode_invite(invite)
-    _load_mcp_config(Path.cwd() / ".mcp.json")  # refuse a broken file before contacting anyone
+    project = Path.cwd()
+    _load_mcp_config(project / ".mcp.json")  # refuse a broken file before contacting anyone
     key = identity_key()
-    # Claim the name now: a taken name or a stale invite shows up here, not
+    # Claim the names now: a taken name or a stale invite shows up here, not
     # later inside Claude Code.
-    unreachable = None
-    try:
-        register_name(url, room, token, name, key)
-    except RelayRefused as exc:
-        raise _join_refused(exc) from None
-    except RelayUnreachable as exc:
-        unreachable = str(exc)
+    unreachable = _claim_names(url, room, token, names, key)
 
-    path = write_mcp_config(url, room, token, name, peer=allow, key=key)
+    path = write_mcp_config(url, room, token, name, peer=allow, key=key,
+                            write_file=DEFAULT_CLIENT in clients)
+    if clients != [DEFAULT_CLIENT]:
+        base = load_settings(project)
+        paths = {c: (path if c == DEFAULT_CLIENT else write_client(project, c, names[c], base)[0])
+                 for c in clients}
     if unreachable:
         print(f"No bridge answered at {url} ({unreachable}).")
         print("  Usually the host's bridge has stopped, or this invite is from an earlier")
@@ -830,14 +961,63 @@ def cmd_join(invite: str, name: str, allow: Optional[str]) -> int:
         print("  invite from their current run. (If it is current, see Troubleshooting in")
         print("  the README.) Saved the settings anyway, in case the bridge comes back.\n")
     else:
-        print(f"Joined bridge room '{room}' as '{name}'.")
-    print(f"Wrote {path}\n")
-    _warn_if_inside_ccbridge()
-    _print_notes(mcp_config_warnings())
-    print("Now restart Claude Code in this folder, approve the 'ccbridge' MCP server")
-    print("when it asks, then ask it:")
+        print(f"Joined bridge room '{room}' as '{', '.join(names.values())}'.")
+    if clients == [DEFAULT_CLIENT]:
+        print(f"Wrote {path}\n")
+        _warn_if_inside_ccbridge()
+        _print_notes(mcp_config_warnings())
+        print("Now restart Claude Code in this folder, approve the 'ccbridge' MCP server")
+        print("when it asks, then ask it:")
+    else:
+        _warn_if_inside_ccbridge()
+        _print_notes(mcp_config_warnings())
+        _print_restart(clients, paths)
+        print("Then ask any of them:")
     print('    "check the bridge - who is online?"')
     return EXIT_UNREACHABLE if unreachable else 0
+
+
+def cmd_connect(raw_clients: str, name: Optional[str]) -> int:
+    """Add more tools in this project to the bridge it already uses."""
+    try:
+        clients = parse_clients(raw_clients, find_program)
+    except ClientError as exc:
+        raise SetupError(str(exc)) from None
+    project = Path.cwd()
+    base = load_settings(project)
+    if not all(isinstance(base.get(k), str) for k in
+               ("CCBRIDGE_RELAY_URL", "CCBRIDGE_ROOM", "CCBRIDGE_TOKEN", "CCBRIDGE_NAME")):
+        raise SetupError("this project is not on a bridge yet - run `bridge.py host` or"
+                         " `bridge.py join` in it first")
+    if name:
+        check_name(name)
+    names = _client_names(base["CCBRIDGE_NAME"], clients, override=name)
+    key = base.get("CCBRIDGE_IDENTITY_KEY") or identity_key()
+    unreachable = _claim_names(base["CCBRIDGE_RELAY_URL"], base["CCBRIDGE_ROOM"],
+                               base["CCBRIDGE_TOKEN"], names, key)
+    paths = {}
+    for client in clients:
+        paths[client], copy = write_client(project, client, names[client], base)
+        print(f"{CLIENTS[client].display}: '{names[client]}'")
+        if copy:
+            print(f"  (the previous file was saved as {copy})")
+    if unreachable:
+        print(f"\nNo bridge answered at {base['CCBRIDGE_RELAY_URL']} ({unreachable}); the names"
+              " are claimed when the bridge is back. Saved the settings anyway.")
+    print()
+    _print_restart(clients, paths)
+    return EXIT_UNREACHABLE if unreachable else 0
+
+
+def cmd_clients() -> None:
+    """List the tools ccbridge can set up, and which of them are installed here."""
+    project = Path.cwd()
+    print(f"{'client':<13}{'installed':<11}{'checked':<9}config file")
+    for slug, spec in CLIENTS.items():
+        found = "yes" if is_installed(spec, find_program) else "-"
+        print(f"{slug:<13}{found:<11}{spec.source:<9}{config_path(spec, project)}")
+    print("\n'tested' = set up and seen working here; 'docs' = set up per the tool's docs.")
+    print("Use: bridge.py connect --client cursor,codex   (or --client all-installed)")
 
 
 def _allow_list(raw: Optional[str]) -> Optional[str]:
@@ -871,15 +1051,42 @@ def main(argv: Optional[list[str]] = None) -> None:
                            " messages are accepted")
     join.add_argument("--allow", metavar="NAME",
                       help="only accept messages from this peer (comma-separate several)")
+    client_help = (f"which AI tools in this project to set up: comma-separated, or"
+                   f" all-installed (default {DEFAULT_CLIENT}; see `bridge.py clients`)")
+    for p in (host, join):
+        p.add_argument("--client", metavar="CLIENT", help=client_help)
+    host.add_argument("--local", action="store_true",
+                      help="no tunnel: only programs on this computer can reach the bridge")
+    host.add_argument("--max-members", type=int, metavar="N",
+                      help="let at most N members into the room")
+    connect = sub.add_parser("connect", help="set up more AI tools in a project that already"
+                                             " ran host or join")
+    connect.add_argument("--client", metavar="CLIENT", required=True, help=client_help)
+    connect.add_argument("--name", help="the name to appear under (default <your name>-<client>;"
+                                        " with several clients, used in place of your name)")
+    sub.add_parser("clients", help="list the AI tools ccbridge can set up")
     args = parser.parse_args(argv)
 
     code = 0
     try:
-        allow = _allow_list(args.allow)
-        if args.command == "host":
-            cmd_host(args.name, allow, new_room=args.new_room)
+        if args.command == "clients":
+            cmd_clients()
+            return
+        if args.command == "connect":
+            code = cmd_connect(args.client, args.name)
         else:
-            code = cmd_join(args.invite, args.name, allow)
+            allow = _allow_list(args.allow)
+            try:
+                clients = parse_clients(args.client, find_program)
+            except ClientError as exc:
+                raise SetupError(str(exc)) from None
+            if args.command == "host":
+                if args.max_members is not None and args.max_members < 1:
+                    raise SetupError("--max-members must be at least 1")
+                cmd_host(args.name, allow, new_room=args.new_room, clients=clients,
+                         local=args.local, max_members=args.max_members)
+            else:
+                code = cmd_join(args.invite, args.name, allow, clients=clients)
     except SetupError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
