@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# ccbridge - Copyright (c) 2026 Sourabh Nirvani - https://github.com/sourabhnirvani/ccbridge
+# Licensed under the ccbridge License 1.0 (the LICENSE file in that repository). Free to use with credit;
+# selling it, or claiming it as your own work, is not allowed without the author's written permission.
 """ccbridge - put AI coding agents from different IDEs (and computers) into one live session.
 
     python ccb.py host            start a session; prints a line to paste into another IDE's agent chat

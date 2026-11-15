@@ -209,4 +209,16 @@ tunnel path was tested from the same machine).
 
 ## License
 
-MIT
+ccbridge is **source-available** under the [ccbridge License 1.0](LICENSE). Copyright (c) 2026 Sourabh
+Nirvani.
+
+- **Free to use** for personal, educational, research and non-profit work, and inside companies, including
+  in their internal tools and platforms.
+- **Give credit** wherever it's used in a product, service or platform, or published:
+  *"Uses ccbridge by Sourabh Nirvani - https://github.com/sourabhnirvani/ccbridge"*.
+- **No selling without permission.** Selling it, charging for it, or putting it in something you sell needs
+  the author's written permission first. To ask, [open an issue](https://github.com/sourabhnirvani/ccbridge/issues).
+- **No claiming it as your own.** Keep the author's name and notices. Changed versions must say they are
+  based on ccbridge.
+
+Read [LICENSE](LICENSE) for the exact terms.

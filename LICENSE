@@ -1,21 +1,81 @@
-MIT License
+ccbridge License, version 1.0
 
-Copyright (c) 2026 Sourabh Nirvani
+Copyright (c) 2026 Sourabh Nirvani (https://github.com/sourabhnirvani)
+All rights reserved, except for the permissions this license gives.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+ccbridge (the "Software": the program, its source code, its documentation and its design) was created by
+Sourabh Nirvani (the "Author"). The Software is source-available: you may read it, use it and change it on
+the terms below. It is not open-source software, and it is not in the public domain.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. What you may do, free of charge
+
+   a. Use the Software for personal, educational, research and non-profit purposes.
+
+   b. Use the Software inside a company or other organisation, including in its internal tools, platforms
+      and workflows, as long as you give credit as section 3 requires.
+
+   c. Copy and change the Software for those uses, and share copies or changed versions free of charge,
+      as long as each copy includes this license unchanged and you follow sections 3 and 4.
+
+
+2. What needs the Author's written permission first
+
+   Without the Author's prior written permission, you may not:
+
+   a. sell, rent, lease or sublicense the Software, or a changed version of it;
+
+   b. offer the Software, or a product or service whose value comes wholly or substantially from it, to
+      others for a fee. For example: a paid product, a paid hosted service, or a paid feature of a
+      platform;
+
+   c. include the Software, or a changed version of it, in anything you sell.
+
+   To ask for permission, open an issue at https://github.com/sourabhnirvani/ccbridge or contact the Author
+   through GitHub. Permission counts only if it is given in writing, and only for what it says.
+
+
+3. Credit
+
+   If the Software, or a changed version of it, is used in or by a product, service, platform or tool of a
+   company or organisation, or is published by you in any form, you must give clear, visible credit, for
+   example in its documentation, "About" page or credits:
+
+       Uses ccbridge by Sourabh Nirvani - https://github.com/sourabhnirvani/ccbridge
+
+   You must also keep this license and every copyright and author notice in the source code.
+
+
+4. Authorship
+
+   a. You may not claim, or suggest, that you or anyone other than the Author created, invented or owns the
+      Software, its design or its ideas.
+
+   b. You may not remove or change the Author's name, the copyright notices or this license.
+
+   c. A changed version must say clearly that it has been changed and that it is based on ccbridge by
+      Sourabh Nirvani.
+
+   d. Without the Author's written permission, you may not use the Author's name or the name "ccbridge" to
+      promote your own product or service, or suggest that the Author endorses it.
+
+
+5. If these terms are broken
+
+   If you break any of these terms, every permission this license gives you ends automatically. Only the
+   Author, in writing, can give those permissions back.
+
+
+6. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+   LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+   EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+
+7. Earlier versions
+
+   Versions of ccbridge published before this license under the MIT License stay under the MIT License for
+   anyone who obtained them then. Every version published with this license is covered by this license.
