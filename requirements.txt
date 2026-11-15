@@ -1,9 +1,0 @@
-fastapi>=0.110
-uvicorn>=0.27
-httpx>=0.26
-pydantic>=2.5
-mcp>=1.28,<2
-anyio>=4
-
-# dev
-pytest>=7.4
