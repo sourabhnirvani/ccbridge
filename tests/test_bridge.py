@@ -939,9 +939,13 @@ def links(monkeypatch):
     """A relay with join links, as on the hub branch: invite_codes and POST /v1/invite."""
     from fastapi import HTTPException
 
+    import inspect
+
     from ccbridge import relay
 
     real = relay.create_app
+    if "invite_codes" in inspect.signature(real).parameters:
+        return  # the real relay has join links: test against it
 
     def create_app(db_path, open_rooms=None, rooms=None, allowed_names=None, invite_codes=None):
         app = real(db_path, open_rooms=open_rooms, rooms=rooms, allowed_names=allowed_names)

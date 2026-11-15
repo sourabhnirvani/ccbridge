@@ -1,29 +1,35 @@
 # ccbridge
 
-**Let two people's Claude Code agents talk to each other while working on the same project.**
+**Let AI coding agents talk, share files and work together - across people,
+machines and tools.** Claude Code, Codex, Cursor, Antigravity, Grok Build, Gemini
+CLI, VS Code (Copilot), Kiro, OpenCode, Devin Desktop/Windsurf, Amp, Junie and Zed,
+in any mix.
 
-Claude Code can already message its own sessions — but only within one account, on
-one machine. If you and a teammate are on separate accounts and separate laptops,
-your agents can't reach each other. ccbridge closes that gap.
+Claude Code can already message its own sessions - but only within one account,
+on one machine, and only Claude Code. ccbridge gives every agent in a room the
+same small set of tools, whoever runs it and wherever: two teammates on separate
+laptops, one person's Claude Code and Cursor side by side, or a team of dozens
+(rooms scale to a thousand agents).
 
-Two commands each, and your agent can ask theirs what it just changed.
+One person hosts and sends a link; everyone else joins with it.
 
 ```
-  You                                                     Your teammate
-  ┌────────────────┐                                 ┌────────────────┐
-  │  Claude Code   │                                 │  Claude Code   │
-  │   + ccbridge   │                                 │   + ccbridge   │
-  └───────┬────────┘                                 └────────┬───────┘
-          │  HTTPS                                    HTTPS   │
-          └────────────────►  ┌──────────────┐  ◄────────────┘
-                              │    relay     │
-                              │ rooms+queue  │
-                              │   (SQLite)   │
-                              └──────────────┘
+  Claude Code (you)       Codex (you)        Cursor (teammate)    Grok (teammate)
+        |                     |                     |                    |
+        +---------- HTTPS ----+------+------ HTTPS -+--------------------+
+                                     |
+                         +-----------------------+
+                         |   relay (one room)    |
+                         | messages, channels,   |
+                         | task board, files,    |
+                         | file reservations     |
+                         +-----------------------+
 ```
 
-Four tools show up in each agent: `bridge_status`, `list_peers`, `send_message`,
-`get_messages`.
+Twelve tools show up in each agent: `bridge_status`, `list_peers`, `send_message`,
+`get_messages`, `set_status`, `channels`, `share_file`, `download_file`,
+`create_task`, `list_tasks`, `update_task`, `reserve_files` - see
+[How agents work together](#how-agents-work-together).
 
 ---
 
@@ -98,6 +104,11 @@ Add `--allow <theirname>` to `host` to lock the room to the two of you: nobody
 else can join, even with the invite. On `join`, it accepts messages from that
 person only.
 
+All on one laptop (say, Claude Code and Cursor in the same project)? Use
+`host --local`: no tunnel, nothing reachable from outside, and `connect --client
+cursor` adds the second tool. For a big team, `host --max-members 1000` (the
+default is 32).
+
 Neither command puts a secret in `.mcp.json`: the room token and your identity
 key go into a settings file inside the ccbridge folder (readable only by you, on
 macOS and Linux), and `.mcp.json` just names it. So it is safe in a project that commits its
@@ -123,7 +134,7 @@ What an agent needs to know, precisely:
 | | |
 |---|---|
 | Install | `pip install -r <ccbridge>/requirements.txt` |
-| Verify | `python -m pytest` inside `<ccbridge>` → 388 tests should pass (on Windows, 387 and 1 skipped) |
+| Verify | `python -m pytest` inside `<ccbridge>` → all tests should pass (on Windows: 426 passed, 3 skipped) |
 | Where | Run `bridge.py` **from the project folder**; it writes `.mcp.json` into the current working directory (no secrets in it) and adds it to that folder's `.gitignore` |
 | Host | **First delete `<ccbridge>/invite.txt`** if it exists, then run `python <ccbridge>/bridge.py host <name>` — **long-running**, do not wait for it to exit. Wait for `<ccbridge>/invite.txt` to appear (it does once the bridge is ready). Its first line is the join command with the join link; the last line is the same with the full invite |
 | Join | `python <ccbridge>/bridge.py join <link or invite> <name>` — contacts the bridge, claims the name, writes `.mcp.json`, exits. Exit code 0: joined. 1: refused (link or invite out of date, name taken, room locked), nothing written. 2: no bridge answered — ask the host for a current link (with a full invite, the settings are saved anyway) |
@@ -325,7 +336,9 @@ its next bridge call.
 | `CCBRIDGE_NAME` | How you appear to your peer — **different** for each person |
 | `CCBRIDGE_IDENTITY_KEY` | Your own secret that owns your name — **never** shared (`bridge.py` keeps it in `<ccbridge>/.ccbridge_identity`) |
 | `CCBRIDGE_ALLOWED_PEERS` | Optional comma-separated allowlist of peer names |
-| `CCBRIDGE_CONFIRM_SENDS` | Optional; `1` makes Claude Code ask you before every `send_message` |
+| `CCBRIDGE_CONFIRM_SENDS` | Optional; `1` makes Claude Code ask you before every `send_message`, `share_file`, `create_task` and `update_task` |
+| `CCBRIDGE_CLIENT` | Which tool this is (`claude-code`, `codex`, `cursor`, ...), shown to peers |
+| `CCBRIDGE_PROJECT_DIR` | The project folder: `share_file` reads only inside it, and received files go to its `.ccbridge/inbox/` |
 
 Running the relay directly, without `bridge.py`:
 
@@ -338,7 +351,10 @@ CCBRIDGE_HOST=0.0.0.0 python run_relay.py            # bash/zsh - only behind HT
 $env:CCBRIDGE_HOST="0.0.0.0"; python run_relay.py    # PowerShell - only behind HTTPS
 ```
 
-Relay settings: `CCBRIDGE_PORT`, `CCBRIDGE_DB` (default `./ccbridge.db`). Rooms are
+Relay settings: `CCBRIDGE_PORT`, `CCBRIDGE_DB` (default `./ccbridge.db`),
+`CCBRIDGE_MAX_MEMBERS` (per room, default 1000 when run directly; `bridge.py host`
+uses 32 unless `--max-members`), `CCBRIDGE_MAX_ROOMS` (1000) and
+`CCBRIDGE_MAX_FILE_BYTES` (4 MB). Rooms are
 trust-on-first-use by default: the first join fixes the room's token. Pre-create
 them instead with `CCBRIDGE_ROOMS="room:token,room2:token2"`, and set
 `CCBRIDGE_OPEN_ROOMS=0` to refuse any room not listed.
@@ -353,18 +369,32 @@ the relay serves.
 python -m pytest
 ```
 
-388 tests: relay auth and room isolation, name ownership and resume-after-restart,
-at-least-once delivery and cancelled reads, rate limits, size caps and retention,
-injection and banner-forgery defences (including known bypasses, and linear-time
-checks against a CPU-exhaustion attack), outbound credential checks, a hostile
-relay, the peer allowlist and locked rooms, cursor behaviour, database upgrades,
-invite encoding, setup (secrets kept out of `.mcp.json` and the environment, file
-modes and one-step writes, line endings and byte-order marks, the launcher and
-program lookup, proxies, busy ports and stale invites, dead tunnels, name claims
-at host and join, rooms of moved, copied and upgraded projects), and an
-end-to-end round trip over real HTTP between two sessions.
+About 430 tests (on Windows: 426 passed, 3 skipped): relay auth and room
+isolation, name ownership and resume-after-restart, at-least-once delivery and
+cancelled reads, rate limits, size caps and retention, injection and
+banner-forgery defences (including known bypasses, and linear-time checks
+against a CPU-exhaustion attack), outbound credential checks, a hostile relay,
+the peer allowlist and locked rooms, database upgrades, invites and join links
+(and throttled guessing), every client's config writer (merging, line endings,
+JSONC, backups, never pre-approving tools), and setup end to end. For 0.4:
+channels and replies, waiting reads (including 200 agents waiting at once while
+sends still go through), presence paging, a thousand agents in one room, the
+task board's claim rules, file sharing limits and the inbox, and reservations.
+
+`python scripts/loadtest.py --agents 200 --seconds 30` runs simulated agents
+(plain HTTP clients - no AI model, no tokens) against a real relay process.
+With 200 agents each holding a waiting read open, the relay answered sends in
+about 4 ms. The generator is a single Python process, so its own numbers are an
+upper bound.
 
 ---
+
+## Upgrading from 0.3
+
+0.4 is compatible both ways: a 0.3 agent works with a 0.4 relay (it just lacks
+the new tools), and a 0.4 agent on a 0.3 relay gets a clear "ask the host to
+update" from the new tools. The relay's database is upgraded in place. Run
+`git pull` in the ccbridge folder, restart `host`, and restart your agents.
 
 ## Upgrading from 0.2
 
@@ -393,7 +423,16 @@ the new proof.
 - The host's terminal must stay open; it is the relay. One bridge runs at a time
   per port (`CCBRIDGE_PORT`, default 8787), and `invite.txt` is shared by
   everything hosted from one ccbridge folder.
-- Polling, not push: an agent sees messages when it calls `get_messages`.
+- Polling, not push: an agent sees messages when it calls `get_messages`
+  (which can wait up to 25 s for one). No MCP client lets a server wake an idle
+  agent in every tool, so an agent that is not running a turn hears nothing
+  until its next one.
+- Reservations are advisory: they stop agents that check, not edits.
+- Two windows of one tool in one project run under the same name; `bridge_status`
+  warns about it. Each tool counts as a room member.
+- Codex, Antigravity, Devin/Windsurf, Gemini, Amp, Junie and Zed are configured
+  from their documentation; Claude Code, Cursor, VS Code, Kiro, OpenCode and Grok
+  were also checked live (see [docs/CLIENTS.md](docs/CLIENTS.md)).
 - Lose `.ccbridge_identity` and your name stays reserved in that room for 30 days
   of inactivity (or until the host deletes `ccbridge.db`). Pick a new name meanwhile.
 

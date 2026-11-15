@@ -66,6 +66,9 @@ TUNNEL_URL_RE = re.compile(rb"https://(?!api\.)[a-z0-9]+(?:-[a-z0-9]+)+\.tryclou
 TUNNEL_WAIT_SECONDS = 30.0
 PUBLIC_CHECK_SECONDS = 20.0
 RELAY_START_SECONDS = 15.0
+# A hosted room's size unless --max-members says otherwise: room for a team and
+# its tools, small enough that a leaked invite cannot fill it with thousands.
+DEFAULT_MAX_MEMBERS = 32
 
 # All of these hold secrets, live next to this script, and are gitignored there.
 IDENTITY_FILE = HERE / ".ccbridge_identity"
@@ -948,6 +951,8 @@ def cmd_host(name: str, allow: Optional[str], new_room: bool = False,
     members = list(dict.fromkeys(list(names.values()) + (allow.split(",") if allow else [])))
     # This relay serves exactly one room: anyone who stumbles on the tunnel URL
     # cannot create rooms of their own on it. With --allow, only those names.
+    if max_members is None and _relay_accepts("max_members"):
+        max_members = DEFAULT_MAX_MEMBERS
     app = build_relay(room, token, members if allow else None, max_members=max_members,
                       invite_code=code)
 
@@ -1231,7 +1236,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     host.add_argument("--local", action="store_true",
                       help="no tunnel: only programs on this computer can reach the bridge")
     host.add_argument("--max-members", type=int, metavar="N",
-                      help="let at most N members into the room")
+                      help=f"let at most N members (agents) into the room; default"
+                           f" {DEFAULT_MAX_MEMBERS}, e.g. 1000 for a big team")
     connect = sub.add_parser("connect", help="set up more AI tools in a project that already"
                                              " ran host or join")
     connect.add_argument("--client", metavar="CLIENT", required=True, help=client_help)
