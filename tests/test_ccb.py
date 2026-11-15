@@ -480,8 +480,12 @@ def test_send_reads_a_file_or_stdin(hub, capsys, tmp_path, monkeypatch):
     import io
     monkeypatch.setattr(sys, "stdin", io.StringIO("from stdin"))
     run(capsys, "send", k, "claude", "-")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("also stdin"))
+    run(capsys, "send", k, "claude", "--file", "-")  # what agents naturally try
     out = run(capsys, "wait", hub.host_key, "--timeout", 2)[1]
-    assert 'line one\nline "two"' in out and "from stdin" in out
+    assert 'line one\nline "two"' in out and "from stdin" in out and "also stdin" in out
+    code, out = run(capsys, "send", k, "claude", "--file", tmp_path / "missing.txt")
+    assert code == 1 and "can't read the message file" in out and "Traceback" not in out
 
 
 # --- the real thing: host starts a background hub, a separate process joins ---------------------------

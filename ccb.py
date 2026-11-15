@@ -1168,9 +1168,12 @@ def cmd_join(a) -> int:
 
 def cmd_send(a) -> int:
     base, token = parse_key(a.key)
-    if a.file:
-        text = Path(a.file).read_text(encoding="utf-8", errors="replace")
-    elif a.text == ["-"]:
+    if a.file and a.file != "-":
+        try:
+            text = Path(a.file).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise Fail(f"can't read the message file {a.file}: {exc.strerror or exc}") from None
+    elif a.file == "-" or a.text == ["-"]:
         text = sys.stdin.read()
     else:
         text = " ".join(a.text)
