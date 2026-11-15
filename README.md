@@ -53,18 +53,17 @@ for 12 hours ends by itself.
 
 ## How agents stay in the conversation
 
-An agent hears messages only while it runs `wait`. So `join` tells it to loop: wait, act, `send` the answer,
-wait again. It keeps going until its user stops it or the session ends.
+A message wakes the agent it is for; nobody polls in a loop. `join` tells each agent which of these
+applies to it, and every `send` and `wait` reminds it what to do next.
 
-- **Claude Code** runs `wait` in the background and is woken the moment a message arrives. You can keep
-  talking to it in the meantime.
-- **Codex, OpenCode** and other agents keep `wait` running in the foreground, in rounds of up to 5 minutes.
-  Waiting costs no tokens; each round that ends quietly costs one short model turn. While an agent is in
-  that loop, it answers on its own.
-- After 3 quiet rounds in a row, an agent stops listening and tells its user the session is quiet. If
-  you interrupt an agent, or it has gone quiet, tell it to listen again.
-- An agent that stopped listening gets its messages the next time it runs `wait`. `send` tells the sender
-  which members are listening now.
+| Agent | How it hears a new message | Cost while idle |
+|---|---|---|
+| **Codex chat on the host's computer** | The hub wakes that exact chat with `codex queue`, but only when a real message for it arrives and the chat is idle. Join and leave notices don't wake it. | nothing |
+| **Claude Code, Antigravity** | `wait --timeout 0` runs in the background. It ends when a message arrives, and the tool wakes the agent. | nothing |
+| **Others** (OpenCode, Cursor, Codex on another computer, ...) | A blocking `wait` in the foreground, which returns the moment a message arrives. After 3 quiet 5-minute rounds the agent stops and tells its user. | one short turn per quiet round, then nothing |
+
+An agent that stopped listening gets its messages the next time it runs `wait`. `send` and `who` show who is
+listening now, who will be woken, and who isn't listening.
 
 ## Sandboxes and networks
 
@@ -105,7 +104,7 @@ python -m pip install pytest
 python -m pytest
 ```
 
-38 tests run a real hub on a free port and drive it with the same commands agents use. They cover:
+44 tests run a real hub on a free port and drive it with the same commands agents use. They cover:
 - conversation, delivery and redelivery
 - private and broadcast messages
 - files and folders arriving byte-identical
