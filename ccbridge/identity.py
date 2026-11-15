@@ -34,10 +34,17 @@ def legacy_key_hash(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def join_body(room: str, name: str, key: str, *, register_only: bool = False) -> dict:
-    """The body of a POST /v1/join."""
+def join_body(room: str, name: str, key: str, *, register_only: bool = False,
+              client: str | None = None) -> dict:
+    """The body of a POST /v1/join.
+
+    ``client`` says what kind of agent this is (claude-code, codex, cursor, ...);
+    peers see it next to the name. A relay older than 0.4 ignores it.
+    """
     body = {"room": room, "display_name": name, "identity_key": identity_proof(key, room),
             "identity_scheme": IDENTITY_SCHEME}
     if register_only:
         body["register_only"] = True
+    if client:
+        body["client"] = client
     return body

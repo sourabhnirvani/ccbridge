@@ -298,3 +298,107 @@ def too_large(text: str) -> bool:
 def safe_name(name: object) -> str | None:
     """Return ``name`` if it is a well-formed display name, else ``None``."""
     return name if isinstance(name, str) and NAME_RE.match(name) else None
+
+
+# --- 0.4: channels, clients, files, tasks, reservations -------------------------
+
+# Channels inside a room ("frontend", "review", "ops"). Lower case so "Ops" and
+# "ops" cannot be two channels that look like one.
+CHANNEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]{0,31}\Z")
+# Which kind of agent a session is ("claude-code", "codex", "cursor", ...). Shown
+# to peers, so it is as boring as a name.
+CLIENT_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]{0,31}\Z")
+
+MAX_FILE_NAME_LEN = 120
+MAX_RESERVED_PATH_LEN = 300
+_FILE_NAME_BAD = re.compile(r"[^A-Za-z0-9._\- ]+")
+_WINDOWS_RESERVED = re.compile(r"^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?\Z", re.I)
+
+
+def safe_channel(channel: object) -> str | None:
+    return channel if isinstance(channel, str) and CHANNEL_RE.match(channel) else None
+
+
+def safe_client(client: object) -> str | None:
+    return client if isinstance(client, str) and CLIENT_RE.match(client) else None
+
+
+def one_line(text: str, limit: int) -> tuple[str, list[str]]:
+    """``text`` sanitized, collapsed to one line, and cut to ``limit`` characters.
+
+    For short fields peers see in lists (a status, a task title, a file note's
+    first line), where a newline could fake the start of another entry.
+    """
+    body, flags = sanitize(text)
+    body = re.sub(r"\s+", " ", body).strip()
+    return body[:limit], flags
+
+
+def safe_file_name(name: object) -> str:
+    """A file name that is safe to create on any OS, derived from ``name``.
+
+    Only the last path component survives (no "../", no drive letters), odd
+    characters become "_", leading dots go (no hidden files, no "."/".."), and
+    names Windows reserves ("con", "nul.txt") get a prefix.
+    """
+    raw = name if isinstance(name, str) else ""
+    raw = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    raw = raw.rsplit(":", 1)[-1]  # "C:file" and NTFS streams ("a.txt:evil")
+    raw = unicodedata.normalize("NFKC", raw)
+    cleaned = _FILE_NAME_BAD.sub("_", raw).strip(" .")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.lstrip(".") or "file"
+    if _WINDOWS_RESERVED.match(cleaned):
+        cleaned = "_" + cleaned
+    if len(cleaned) > MAX_FILE_NAME_LEN:
+        stem, dot, ext = cleaned.rpartition(".")
+        if dot and 0 < len(ext) <= 16:
+            cleaned = stem[: MAX_FILE_NAME_LEN - len(ext) - 1] + "." + ext
+        else:
+            cleaned = cleaned[:MAX_FILE_NAME_LEN]
+    return cleaned
+
+
+def normalize_reserved_path(path: object) -> str | None:
+    """A project-relative path or glob in one canonical form, or None if unusable.
+
+    Reservations are compared between machines, so absolute paths (which differ
+    per machine) and ".." (which escapes the project) are refused, and
+    separators are always "/".
+    """
+    if not isinstance(path, str):
+        return None
+    p = path.strip().replace("\\", "/")
+    if not p or len(p) > MAX_RESERVED_PATH_LEN:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in p):
+        return None
+    if p.startswith("/") or re.match(r"^[A-Za-z]:", p):
+        return None
+    parts = [seg for seg in p.split("/") if seg not in ("", ".")]
+    if not parts or any(seg == ".." for seg in parts):
+        return None
+    return "/".join(parts)
+
+
+def reserved_paths_overlap(a: str, b: str) -> bool:
+    """True if two normalized paths or globs can name the same file.
+
+    Case-insensitive, because one peer may be on Windows or macOS. A directory
+    overlaps everything under it.
+    """
+    import fnmatch
+
+    a, b = a.lower(), b.lower()
+    if a == b or a.startswith(b + "/") or b.startswith(a + "/"):
+        return True
+    if fnmatch.fnmatchcase(a, b) or fnmatch.fnmatchcase(b, a):
+        return True
+    # A glob's literal directory part overlapping the other path ("src/*" and "src").
+    for glob, other in ((a, b), (b, a)):
+        if any(ch in glob for ch in "*?["):
+            literal = re.split(r"[*?\[]", glob, maxsplit=1)[0].rstrip("/")
+            if literal and (other == literal or other.startswith(literal + "/")
+                            or literal.startswith(other + "/")):
+                return True
+    return False

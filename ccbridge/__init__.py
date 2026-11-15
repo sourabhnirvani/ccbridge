@@ -1,9 +1,9 @@
-"""ccbridge - a thin, permission-safe message bridge between two people's
-Claude Code sessions.
+"""ccbridge - a thin, permission-safe bridge between many people's AI coding agents
+(Claude Code, Codex, Cursor, Antigravity, Grok Build, Gemini, VS Code, Kiro, ...).
 
 Two parts:
-  * ccbridge.relay      - a small HTTP relay both sides connect to
-  * ccbridge.mcp_server - the MCP server each person adds to their Claude Code
+  * ccbridge.relay      - a small HTTP relay everyone in a room connects to
+  * ccbridge.mcp_server - the MCP server each agent runs, in whatever client it uses
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -329,8 +329,12 @@ def test_hostile_relay_error_text_is_sanitized():
 
 def test_tools_are_registered_and_run_off_the_event_loop(configured):
     tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
-    assert set(tools) == {"bridge_status", "list_peers", "send_message", "get_messages"}
-    assert set(tools["send_message"].inputSchema["properties"]) == {"text", "to"}
+    assert set(tools) == {"bridge_status", "list_peers", "send_message", "get_messages", "set_status",
+                          "channels", "share_file", "download_file", "create_task", "list_tasks",
+                          "update_task", "reserve_files"}
+    # Portable names: Cursor drops names with "-" or ".", Grok skips "__", Gemini caps length.
+    assert all(re.fullmatch(r"[a-z]+(?:_[a-z]+)*", name) and len(name) <= 20 for name in tools)
+    assert set(tools["send_message"].inputSchema["properties"]) == {"text", "to", "channel", "reply_to"}
     assert tools["send_message"].inputSchema["required"] == ["text"]
 
     result = asyncio.run(mcp_server.mcp.call_tool("bridge_status", {}))
@@ -339,7 +343,7 @@ def test_tools_are_registered_and_run_off_the_event_loop(configured):
 
 def test_wrap_includes_provenance_and_safety_note():
     out = wrap_peer_message("friend", "hello", [], tag="0123abcd")
-    assert "from: friend (a different person's Claude Code session)" in out
+    assert "from: friend (a different person's agent session)" in out
     assert SAFETY_NOTE in out
     assert out.startswith(banner_top("0123abcd"))
     assert out.count(banner_end("0123abcd")) == 1

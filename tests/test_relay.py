@@ -384,14 +384,16 @@ def test_closed_relay_does_not_serve_rooms_left_from_an_earlier_run(tmp_path, mo
         second.app.state.conn.close()
 
 
-def test_rate_limit_also_applies_to_the_room_as_a_whole(client):
+def test_rate_limit_also_applies_to_the_room_as_a_whole(monkeypatch):
     """Regression: the limit was per name, and one token holder can make many names."""
+    monkeypatch.setattr(relay, "ROOM_RATE_LIMIT_MESSAGES", 120)
+    client = TestClient(create_app(":memory:"))
     people = [join(client, "duo", f"sock-{i}", "t").json() for i in range(3)]
     accepted = 0
     for who in people:
         for _ in range(RATE_LIMIT_MESSAGES):
             accepted += send(client, who, "spam").status_code == 200
-    assert accepted == ROOM_RATE_LIMIT_MESSAGES
+    assert accepted == 120
 
 
 def test_rate_limited_sends_are_not_sanitized(client, monkeypatch):
